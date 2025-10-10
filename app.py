@@ -9,10 +9,9 @@ load_dotenv()
 B2_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")  # name (not bucketId) used in URLs
-FIREBASE_CRED_JSON = os.getenv("FIREBASE_CRED_JSON")
 
 # Init Firebase Admin
-cred = credentials.Certificate(FIREBASE_CRED_JSON)
+cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
 initialize_app(cred)
 db = firestore.client()
 
@@ -159,4 +158,5 @@ def get_upload_url():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
 
