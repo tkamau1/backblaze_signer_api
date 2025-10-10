@@ -155,12 +155,9 @@ def get_upload_url():
     except Exception as e:
         return jsonify({"error":"Backblaze error", "detail": str(e)}), 500
 
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
 @app.route("/")
 def health():
     return jsonify({"status": "ok"}), 200
 
-
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
