@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 from flask import Flask, request, jsonify
 from firebase_admin import auth, credentials, initialize_app, firestore
@@ -160,3 +159,4 @@ def get_upload_url():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
