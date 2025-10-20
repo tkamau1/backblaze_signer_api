@@ -6,12 +6,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- ENV VARIABLES ---
+# --- ENV ---
 B2_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
-B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")  # ✅ use this instead of list_buckets
-DEFAULT_VALID_SECONDS = 3600  # 1 hour default for signed URLs
+B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
+BASE_FILE_URL = f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}"
+DEFAULT_VALID_SECONDS = 9000  # 2 hour 30 mins for movies
+SERIES_VALID_SECONDS = 86400  # 24 hours
+CLIP_VALID_SECONDS = 900      # 15 min
+POSTER_VALID_SECONDS = 600    # 10 min
 
 # --- FIREBASE ---
 cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
@@ -29,7 +33,6 @@ def authorize_b2():
     resp.raise_for_status()
     return resp.json()
 
-
 def require_firebase_user():
     """Extract and verify Firebase ID token."""
     auth_header = request.headers.get("Authorization", "")
@@ -42,129 +45,214 @@ def require_firebase_user():
     except Exception as e:
         return None, jsonify({"error": "Invalid Firebase token", "detail": str(e)}), 401
 
+def generate_signed_url(file_name, valid_seconds):
+    """Return a signed download URL for a specific file."""
+    auth_data = authorize_b2()
+    api_url = auth_data["apiUrl"]
+    auth_token = auth_data["authorizationToken"]
+
+    r = requests.post(f"{api_url}/b2api/v2/b2_get_download_authorization",
+                      headers={"Authorization": auth_token},
+                      json={
+                          "bucketId": B2_BUCKET_ID,
+                          "fileNamePrefix": file_name,
+                          "validDurationInSeconds": valid_seconds
+                      })
+    r.raise_for_status()
+    token = r.json()["authorizationToken"]
+    return f"{BASE_FILE_URL}/{file_name}?Authorization={token}"
 
 # --- ROUTES ---
 
 @app.route("/get_signed_url", methods=["POST"])
 def get_signed_url():
-    """Generate temporary signed URL for purchased file."""
+    """Generate signed URL for purchased movie."""
     user, err, code = require_firebase_user()
     if err:
         return err, code
 
     payload = request.get_json() or {}
     file_name = payload.get("file")
-    valid_seconds = int(payload.get("validSeconds", DEFAULT_VALID_SECONDS))
-
     if not file_name:
-        return jsonify({"error": "Missing file name"}), 400
+        return jsonify({"error": "Missing file"}), 400
 
-    # Check purchase
-    uid = user.get("uid")
-    purchases = db.collection("purchases") \
+    uid = user["uid"]
+    purchase = db.collection("purchases") \
         .where("userId", "==", uid) \
-        .where("file", "==", file_name) \
-        .where("status", "==", "success") \
+        .where("itemId", "==", os.path.basename(file_name)) \
+        .where("itemType", "==", "movie") \
+        .where("status", "==", "completed") \
         .limit(1).get()
-    if not purchases:
+    if not purchase:
         return jsonify({"error": "Not purchased"}), 403
 
     try:
-        auth_data = authorize_b2()
-        api_url = auth_data["apiUrl"]
-        auth_token = auth_data["authorizationToken"]
-
-        # Request signed authorization token
-        resp = requests.post(f"{api_url}/b2api/v2/b2_get_download_authorization",
-                             headers={"Authorization": auth_token},
-                             json={
-                                 "bucketId": B2_BUCKET_ID,
-                                 "fileNamePrefix": file_name,
-                                 "validDurationInSeconds": valid_seconds
-                             })
-        resp.raise_for_status()
-        data = resp.json()
-        signed_url = f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/{file_name}?Authorization={data['authorizationToken']}"
-        return jsonify({"url": signed_url, "expiresIn": valid_seconds}), 200
-
+        signed_url = generate_signed_url(file_name, DEFAULT_VALID_SECONDS)
+        return jsonify({"url": signed_url, "expiresIn": DEFAULT_VALID_SECONDS}), 200
     except Exception as e:
         return jsonify({"error": "Backblaze error", "detail": str(e)}), 500
 
 
-@app.route("/get_upload_url", methods=["POST"])
-def get_upload_url():
-    """Allow DJ/admin users to upload a file."""
+@app.route("/get_series_signed_urls", methods=["POST"])
+def get_series_signed_urls():
+    """Generate signed URLs for all episodes in a purchased series season."""
     user, err, code = require_firebase_user()
     if err:
         return err, code
 
-    uid = user.get("uid")
-    doc = db.collection("users").document(uid).get()
-    role = doc.to_dict().get("role") if doc.exists else None
-    if role not in ["dj", "admin"]:
-        return jsonify({"error": "Unauthorized - not a DJ or admin"}), 403
+    payload = request.get_json() or {}
+    folder = payload.get("folder")  # e.g., "uploads/dj_junior/series/TULSA_KING/season_1/"
+    item_id = payload.get("itemId")
+    season = payload.get("season")
 
-    data = request.get_json() or {}
-    file_name = data.get("fileName")
-    if not file_name:
-        return jsonify({"error": "Missing fileName"}), 400
+    if not folder or not item_id or not season:
+        return jsonify({"error": "Missing folder, itemId or season"}), 400
 
-    # Enforce folder naming (each DJ uploads to their folder)
-    if role == "dj" and not file_name.startswith(f"uploads/{uid}/"):
-        return jsonify({"error": "Upload path not allowed"}), 403
+    uid = user["uid"]
+    purchase = db.collection("purchases") \
+        .where("userId", "==", uid) \
+        .where("itemId", "==", item_id) \
+        .where("itemType", "==", "series") \
+        .where("season", "==", int(season)) \
+        .where("status", "==", "completed") \
+        .limit(1).get()
+    if not purchase:
+        return jsonify({"error": "Season not purchased"}), 403
 
     try:
+        # List all files under the season folder (episodes)
         auth_data = authorize_b2()
         api_url = auth_data["apiUrl"]
         auth_token = auth_data["authorizationToken"]
 
-        resp = requests.post(f"{api_url}/b2api/v2/b2_get_upload_url",
+        resp = requests.post(f"{api_url}/b2api/v2/b2_list_file_names",
                              headers={"Authorization": auth_token},
-                             json={"bucketId": B2_BUCKET_ID})
+                             json={"bucketId": B2_BUCKET_ID, "prefix": folder, "maxFileCount": 1000})
         resp.raise_for_status()
-        upload_info = resp.json()
+        files = resp.json().get("files", [])
 
-        return jsonify({
-            "uploadUrl": upload_info["uploadUrl"],
-            "uploadAuthToken": upload_info["authorizationToken"],
-            "fileName": file_name
-        }), 200
+        urls = []
+        for f in files:
+            file_name = f["fileName"]
+            signed_url = generate_signed_url(file_name, SERIES_VALID_SECONDS)
+            urls.append({"file": file_name, "url": signed_url})
+
+        return jsonify({"season": season, "urls": urls, "expiresIn": SERIES_VALID_SECONDS}), 200
 
     except Exception as e:
         return jsonify({"error": "Backblaze error", "detail": str(e)}), 500
 
 
-@app.route("/get_preview_url", methods=["POST"])
-def get_preview_url():
-    """Public or limited access short-lived URL (e.g. trailer)."""
+@app.route("/get_clip_url", methods=["POST"])
+def get_clip_url():
+    """Generate signed URL for a public clip (no purchase required)."""
     payload = request.get_json() or {}
     file_name = payload.get("file")
-    valid_seconds = int(payload.get("validSeconds", 300))  # shorter: 5 min
-
     if not file_name:
         return jsonify({"error": "Missing file"}), 400
 
     try:
+        signed_url = generate_signed_url(file_name, CLIP_VALID_SECONDS)
+        return jsonify({"url": signed_url, "expiresIn": CLIP_VALID_SECONDS}), 200
+    except Exception as e:
+        return jsonify({"error": "Backblaze error", "detail": str(e)}), 500
+
+
+@app.route("/get_bulk_previews", methods=["POST"])
+def get_bulk_previews():
+    """Get signed URLs for all posters in a folder or all subfolders."""
+    payload = request.get_json() or {}
+    folder = payload.get("folder", "posters/")
+
+    try:
         auth_data = authorize_b2()
         api_url = auth_data["apiUrl"]
         auth_token = auth_data["authorizationToken"]
 
-        resp = requests.post(f"{api_url}/b2api/v2/b2_get_download_authorization",
-                             headers={"Authorization": auth_token},
-                             json={
-                                 "bucketId": B2_BUCKET_ID,
-                                 "fileNamePrefix": file_name,
-                                 "validDurationInSeconds": valid_seconds
-                             })
-        resp.raise_for_status()
-        data = resp.json()
+        folders = []
+        if folder.endswith("/"):
+            # Get top-level posters/movies, posters/series, etc.
+            resp = requests.post(f"{api_url}/b2api/v2/b2_list_file_names",
+                                 headers={"Authorization": auth_token},
+                                 json={"bucketId": B2_BUCKET_ID, "prefix": folder, "maxFileCount": 1000})
+            resp.raise_for_status()
+            files = resp.json().get("files", [])
+        else:
+            # Per-folder only
+            resp = requests.post(f"{api_url}/b2api/v2/b2_list_file_names",
+                                 headers={"Authorization": auth_token},
+                                 json={"bucketId": B2_BUCKET_ID, "prefix": folder, "maxFileCount": 1000})
+            resp.raise_for_status()
+            files = resp.json().get("files", [])
 
-        signed_url = f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}/{file_name}?Authorization={data['authorizationToken']}"
-        return jsonify({"url": signed_url, "expiresIn": valid_seconds}), 200
+        previews = []
+        for f in files:
+            file_name = f["fileName"]
+            if not file_name.lower().endswith((".jpg", ".png", ".jpeg", ".webp")):
+                continue
+            signed_url = generate_signed_url(file_name, POSTER_VALID_SECONDS)
+            previews.append({"file": file_name, "url": signed_url})
+
+        return jsonify({"count": len(previews), "previews": previews, "expiresIn": POSTER_VALID_SECONDS}), 200
 
     except Exception as e:
         return jsonify({"error": "Backblaze error", "detail": str(e)}), 500
 
+@app.route("/get_collection_signed_urls", methods=["POST"])
+def get_collection_signed_urls():
+    """Generate signed URLs for all movies in a purchased collection."""
+    user, err, code = require_firebase_user()
+    if err:
+        return err, code
+
+    payload = request.get_json() or {}
+    folder = payload.get("folder")  # e.g., "uploads/DJ_DHAVEMAN/collections/INSIDIOUS_1_5/"
+    item_id = payload.get("itemId")
+
+    if not folder or not item_id:
+        return jsonify({"error": "Missing folder or itemId"}), 400
+
+    uid = user["uid"]
+
+    purchase = db.collection("purchases") \
+        .where("userId", "==", uid) \
+        .where("itemId", "==", item_id) \
+        .where("itemType", "==", "collection") \
+        .where("status", "==", "completed") \
+        .limit(1).get()
+
+    if not purchase:
+        return jsonify({"error": "Collection not purchased"}), 403
+
+    try:
+        auth_data = authorize_b2()
+        api_url = auth_data["apiUrl"]
+        auth_token = auth_data["authorizationToken"]
+
+        # List all movie files in that collection folder
+        resp = requests.post(f"{api_url}/b2api/v2/b2_list_file_names",
+                             headers={"Authorization": auth_token},
+                             json={"bucketId": B2_BUCKET_ID, "prefix": folder, "maxFileCount": 1000})
+        resp.raise_for_status()
+        files = resp.json().get("files", [])
+
+        urls = []
+        for f in files:
+            file_name = f["fileName"]
+            if not file_name.lower().endswith((".mp4", ".mkv", ".mov")):
+                continue
+            signed_url = generate_signed_url(file_name, SERIES_VALID_SECONDS)  # reuse 24h validity
+            urls.append({"file": file_name, "url": signed_url})
+
+        return jsonify({
+            "collection": os.path.basename(folder.strip("/")),
+            "count": len(urls),
+            "urls": urls,
+            "expiresIn": SERIES_VALID_SECONDS
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": "Backblaze error", "detail": str(e)}), 500
 
 @app.route("/")
 def health():
