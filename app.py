@@ -15,8 +15,8 @@ B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
 DEFAULT_VALID_SECONDS = 9000  # 2h 30m for movies
 SERIES_VALID_SECONDS = 86400  # 24h
-CLIP_VALID_SECONDS = 900      # 15m
-POSTER_VALID_SECONDS = 600    # 10m
+CLIP_VALID_SECONDS = 86400      # 24h
+POSTER_VALID_SECONDS = 86400    # 24h
 MAX_THREADS = 10              # parallelism for bulk URL generation
 
 # --- FIREBASE ---
@@ -254,3 +254,4 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
