@@ -11,7 +11,6 @@ B2_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
-BASE_FILE_URL = f"https://f000.backblazeb2.com/file/{B2_BUCKET_NAME}"
 DEFAULT_VALID_SECONDS = 9000  # 2 hour 30 mins for movies
 SERIES_VALID_SECONDS = 86400  # 24 hours
 CLIP_VALID_SECONDS = 900      # 15 min
@@ -45,6 +44,11 @@ def require_firebase_user():
     except Exception as e:
         return None, jsonify({"error": "Invalid Firebase token", "detail": str(e)}), 401
 
+def get_download_url():
+    """Fetch the correct download URL from Backblaze account."""
+    auth_data = authorize_b2()
+    return f"{auth_data['downloadUrl']}/file/{B2_BUCKET_NAME}"
+
 def generate_signed_url(file_name, valid_seconds):
     """Return a signed download URL for a specific file."""
     auth_data = authorize_b2()
@@ -60,7 +64,9 @@ def generate_signed_url(file_name, valid_seconds):
                       })
     r.raise_for_status()
     token = r.json()["authorizationToken"]
-    return f"{BASE_FILE_URL}/{file_name}?Authorization={token}"
+
+    download_base = f"{auth_data['downloadUrl']}/file/{B2_BUCKET_NAME}"
+    return f"{download_base}/{file_name}?Authorization={token}"
 
 # --- ROUTES ---
 
@@ -261,3 +267,4 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
