@@ -3,6 +3,7 @@ import requests
 from flask import Flask, request, jsonify
 from firebase_admin import auth, credentials, initialize_app, firestore
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -25,12 +26,14 @@ app = Flask(__name__)
 
 # --- UTILITIES ---
 
-def authorize_b2():
-    """Authorize with Backblaze B2."""
-    resp = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
-                        auth=(B2_KEY_ID, B2_APP_KEY))
-    resp.raise_for_status()
-    return resp.json()
+b2_auth_cache = {"expires": datetime.min, "auth_data": None}
+def authorize_b2_cached():
+    if datetime.utcnow() < b2_auth_cache["expires"]:
+        return b2_auth_cache["auth_data"]
+    auth_data = authorize_b2()
+    b2_auth_cache["auth_data"] = auth_data
+    b2_auth_cache["expires"] = datetime.utcnow() + timedelta(hours=23)  # keep buffer
+    return auth_data
 
 def require_firebase_user():
     """Extract and verify Firebase ID token."""
@@ -267,4 +270,5 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
 
