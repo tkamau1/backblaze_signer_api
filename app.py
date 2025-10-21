@@ -5,6 +5,7 @@ from firebase_admin import auth, credentials, initialize_app, firestore
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from flask_cors import CORS
 
 load_dotenv()
 
@@ -25,6 +26,7 @@ initialize_app(cred)
 db = firestore.client()
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- B2 Caching ---
 b2_auth_cache = {"expires": datetime.min, "auth_data": None}
@@ -254,4 +256,5 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
 
