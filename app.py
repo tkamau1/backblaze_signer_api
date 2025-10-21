@@ -34,7 +34,7 @@ b2_auth_cache = {"expires": datetime.min, "auth_data": None}
 
 # --- TTL CACHES ---
 signed_url_cache = TTLCache(maxsize=5000, ttl=POSTER_VALID_SECONDS)
-list_cache = TTLCache(maxsize=100, ttl=300)
+list_cache = TTLCache(maxsize=100, ttl=86400)
 
 def authorize_b2_cached():
     """Authorize with B2 and cache."""
@@ -101,7 +101,7 @@ def generate_signed_url(file_name, valid_seconds, auth_data=None):
 
 # --- LIST FILES WITH CACHE ---
 def list_files_cached(auth_data, prefix):
-    """List files with 5-min TTL cache."""
+    """List files with 24h TTL cache."""
     if prefix in list_cache:
         return list_cache[prefix]
 
@@ -297,3 +297,4 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
