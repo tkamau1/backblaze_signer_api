@@ -1,300 +1,380 @@
 import os
 import requests
-from flask import Flask, request, jsonify
-from firebase_admin import auth, credentials, initialize_app, firestore
-from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any, Tuple, Optional
+
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from dotenv import load_dotenv
 from cachetools import TTLCache
+
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
 
 load_dotenv()
 
-# --- ENV ---
+# --- BACKBLAZE CONFIG ---
 B2_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
-DEFAULT_VALID_SECONDS = 9000    # 2h 30m for movies
-SERIES_VALID_SECONDS = 86400    # 24h
-CLIP_VALID_SECONDS = 86400      # 24h
-POSTER_VALID_SECONDS = 86400    # 24h
+
+# --- SIGNED URL TTLs ---
+MOVIE_TTL = 14400        # 4 hours 
+SERIES_TTL = 86400       # 24 hours 
+COLLECTION_TTL = 86400   # 24 hours 
+
 MAX_THREADS = 10
+# TTL is 10 minutes (600s), ensuring it's far less than any B2 URL expiry (min 4h)
+PER_USER_RESPONSE_TTL = 600 
 
-# --- FIREBASE ---
-cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
-initialize_app(cred)
+LONGEST_TTL = max(MOVIE_TTL, SERIES_TTL, COLLECTION_TTL) 
+
+# Initialize Firebase
+try:
+    cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+except Exception:
+    print("Warning: Failed to load service account key. Using default credentials.")
+    firebase_admin.initialize_app()
+    
 db = firestore.client()
-
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
-# --- B2 AUTH CACHE ---
-b2_auth_cache = {"expires": datetime.min, "auth_data": None}
+# --- CACHING LAYERS ---
+b2_auth_cache: Dict[str, Any] = {
+    "expires": datetime.min,
+    "data": None
+}
+signed_url_cache = TTLCache(maxsize=5000, ttl=LONGEST_TTL) 
+per_user_response_cache = TTLCache(maxsize=1000, ttl=PER_USER_RESPONSE_TTL)
 
-# --- TTL CACHES ---
-signed_url_cache = TTLCache(maxsize=5000, ttl=POSTER_VALID_SECONDS)
-list_cache = TTLCache(maxsize=100, ttl=86400)
 
-def authorize_b2_cached():
-    """Authorize with B2 and cache."""
+# --- AUTHENTICATION & ENTITLEMENT (Updated) ---
+
+def require_auth() -> Tuple[Optional[str], Optional[Response], Optional[int]]:
+    """Verifies Firebase ID token and returns UID."""
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return None, jsonify({"error": "Missing token"}), 401
+    try:
+        token = header.split(" ", 1)[1]
+        decoded = auth.verify_id_token(token)
+        uid = decoded["uid"] 
+        request.uid = uid 
+        return uid, None, None
+    except auth.InvalidIdToken:
+        return None, jsonify({"error": "Invalid token"}), 401
+    except Exception:
+        return None, jsonify({"error": "Authentication failed"}), 401
+
+
+def assert_entitlement(uid: str, content_id: str, content_type: str, series_id: Optional[str] = None, movie_id: Optional[str] = None) -> None:
+    """
+    Checks if the user is entitled to content.
+    content_id is the primary ID (Movie ID, Series ID, Collection ID).
+    movie_id and series_id/season_id are used for complex entitlement checks.
+    """
+    
+    # Base query for user purchases
+    purchases_ref = db.collection("users").document(uid).collection("purchases")\
+        .where("purchaseStatus", "==", "complete")
+
+    if content_type == "season":
+        # content_id here is the season's document ID (e.g., 's01', 's02'), and series_id is required
+        if not series_id:
+            raise ValueError("Series ID is required for season entitlement check.")
+            
+        snaps = purchases_ref\
+            .where("itemType", "in", ["series", "season"])\
+            .get()
+            
+        # Entitled if user bought the whole series OR the specific season
+        is_entitled = any(s.to_dict()["itemId"] == series_id and s.to_dict()["itemType"] == "series"
+                          or s.to_dict()["itemId"] == content_id and s.to_dict()["itemType"] == "season"
+                          for s in snaps)
+                          
+        if not is_entitled:
+            raise PermissionError(f"Not entitled to season {content_id} in series {series_id}")
+
+    elif content_type == "collectionMovie":
+        # content_id is the Collection ID, movie_id is the specific Movie ID
+        if not movie_id:
+            raise ValueError("movie_id is required for collectionMovie entitlement check.")
+
+        snaps = purchases_ref.where("itemType", "in", ["collection", "collectionMovie"]).get()
+
+        # Entitled if user bought the collection (itemId=Collection ID) OR the single movie (itemId=Movie ID)
+        is_entitled = any(
+            (s.to_dict()["itemId"] == content_id and s.to_dict()["itemType"] == "collection") or
+            (s.to_dict()["itemId"] == movie_id and s.to_dict()["itemType"] == "collectionMovie")
+            for s in snaps
+        )
+
+        if not is_entitled:
+            raise PermissionError(f"Not entitled to movie {movie_id} (collection ID {content_id})")
+
+    else:
+        # Standard check for: movie, series, collection
+        snap = purchases_ref\
+            .where("itemId", "==", content_id)\
+            .where("itemType", "==", content_type)\
+            .limit(1).get()
+        if not snap:
+            raise PermissionError(f"Not purchased: {content_type} ID {content_id}")
+
+# --- BACKBLAZE B2 AUTH & SIGNING (Unchanged) ---
+def authorize_b2() -> Dict[str, Any]:
+    global b2_auth_cache
     if datetime.utcnow() < b2_auth_cache["expires"]:
-        return b2_auth_cache["auth_data"]
+        return b2_auth_cache["data"]
 
-    resp = requests.get(
+    r = requests.get(
         "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
         auth=(B2_KEY_ID, B2_APP_KEY),
-        timeout=10
-    )
-    resp.raise_for_status()
-    auth_data = resp.json()
-    b2_auth_cache.update({
-        "auth_data": auth_data,
-        "expires": datetime.utcnow() + timedelta(hours=23)
-    })
-    return auth_data
-
-
-def require_firebase_user():
-    """Validate Firebase ID token."""
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None, jsonify({"error": "Missing or invalid Authorization header"}), 401
-    token = auth_header.split(" ", 1)[1]
-    try:
-        decoded = auth.verify_id_token(token)
-        return decoded, None, None
-    except Exception as e:
-        return None, jsonify({"error": "Invalid Firebase token", "detail": str(e)}), 401
-
-
-# --- SIGNED URL WITH CACHE ---
-def generate_signed_url(file_name, valid_seconds, auth_data=None):
-    """Generate or reuse signed download URL."""
-    if file_name in signed_url_cache:
-        return signed_url_cache[file_name]
-
-    if not auth_data:
-        auth_data = authorize_b2_cached()
-
-    api_url = auth_data["apiUrl"]
-    auth_token = auth_data["authorizationToken"]
-
-    r = requests.post(
-        f"{api_url}/b2api/v2/b2_get_download_authorization",
-        headers={"Authorization": auth_token},
-        json={
-            "bucketId": B2_BUCKET_ID,
-            "fileNamePrefix": file_name,
-            "validDurationInSeconds": valid_seconds
-        },
-        timeout=10
+        timeout=30 
     )
     r.raise_for_status()
-    token = r.json()["authorizationToken"]
+    data = r.json()
 
-    download_base = f"{auth_data['downloadUrl']}/file/{B2_BUCKET_NAME}"
-    signed_url = f"{download_base}/{file_name}?Authorization={token}"
-    signed_url_cache[file_name] = signed_url
-    return signed_url
+    b2_auth_cache["data"] = data
+    b2_auth_cache["expires"] = datetime.utcnow() + timedelta(hours=23)
+    return data
 
-
-# --- LIST FILES WITH CACHE ---
-def list_files_cached(auth_data, prefix):
-    """List files with 24h TTL cache."""
-    if prefix in list_cache:
-        return list_cache[prefix]
-
-    api_url = auth_data["apiUrl"]
-    auth_token = auth_data["authorizationToken"]
-    files = []
-    next_name = None
-
-    while True:
-        payload = {"bucketId": B2_BUCKET_ID, "prefix": prefix, "maxFileCount": 1000}
-        if next_name:
-            payload["startFileName"] = next_name
-
-        resp = requests.post(
-            f"{api_url}/b2api/v2/b2_list_file_names",
-            headers={"Authorization": auth_token},
-            json=payload,
+def sign_b2(file_path: str, expires: int) -> str:
+    if file_path in signed_url_cache:
+        return signed_url_cache[file_path]
+    try:
+        auth_data = authorize_b2()
+        r = requests.post(
+            f"{auth_data['apiUrl']}/b2api/v2/b2_get_download_authorization",
+            headers={"Authorization": auth_data["authorizationToken"]},
+            json={
+                "bucketId": B2_BUCKET_ID,
+                "fileNamePrefix": file_path,
+                "validDurationInSeconds": expires
+            },
             timeout=10
         )
-        resp.raise_for_status()
-        data = resp.json()
-        files.extend(data.get("files", []))
-        next_name = data.get("nextFileName")
-        if not next_name:
-            break
+        r.raise_for_status()
+        token = r.json()["authorizationToken"]
+        url = f"{auth_data['downloadUrl']}/file/{B2_BUCKET_NAME}/{file_path}?Authorization={token}"
+        signed_url_cache[file_path] = url
+        return url
+    except requests.RequestException as e:
+        print(f"B2 signing failed for {file_path}: {e}")
+        raise
 
-    list_cache[prefix] = files
-    return files
+# --- FIRESTORE HELPERS (Unchanged) ---
+
+def get_movie(movie_id: str) -> Dict[str, Any]:
+    doc = db.collection("movies").document(movie_id).get()
+    if not doc.exists:
+        raise FileNotFoundError(f"Movie with ID {movie_id} not found.")
+    return doc.to_dict()
+
+def get_collection_movies(collection_id: str) -> List[Dict[str, Any]]:
+    doc = db.collection("collections").document(collection_id).get()
+    if not doc.exists:
+        raise FileNotFoundError(f"Collection with ID {collection_id} not found.")
+    
+    return doc.to_dict().get("movies", [])
+
+def get_episodes(series_id: str, season_doc_id: str) -> List[Dict[str, Any]]:
+    snaps = (
+        db.collection("series")
+        .document(series_id)
+        .collection("seasons")
+        .document(season_doc_id)
+        .collection("episodes")
+        .where("status", "==", "public")
+        .get()
+    )
+    return [s.to_dict() for s in snaps]
 
 
-# --- ROUTES ---
+# --- API ENDPOINTS (Updated for new assert_entitlement signature) ---
 
-@app.route("/get_signed_url", methods=["POST"])
-def get_signed_url():
-    user, err, code = require_firebase_user()
+@app.post("/sign/movie")
+def sign_movie():
+    uid, err, code = require_auth()
     if err: return err, code
 
-    payload = request.get_json() or {}
-    file_name = payload.get("file")
-    if not file_name:
-        return jsonify({"error": "Missing file"}), 400
-
-    uid = user["uid"]
-    purchase = db.collection("purchases") \
-        .where("userId", "==", uid) \
-        .where("itemId", "==", os.path.basename(file_name)) \
-        .where("itemType", "==", "movie") \
-        .where("status", "==", "completed") \
-        .limit(1).get()
-    if not purchase:
-        return jsonify({"error": "Not purchased"}), 403
-
     try:
-        signed_url = generate_signed_url(file_name, DEFAULT_VALID_SECONDS)
-        return jsonify({"url": signed_url, "expiresIn": DEFAULT_VALID_SECONDS}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        movie_id = request.json["movieId"]
+        
+        cache_key = f"movie_{uid}_{movie_id}"
+        if cache_key in per_user_response_cache:
+            return per_user_response_cache[cache_key]
+
+        # Check Entitlement
+        assert_entitlement(uid, movie_id, "movie")
+        movie = get_movie(movie_id)
+        
+        response_data = {
+            "url": sign_b2(movie["videoPath"], MOVIE_TTL),
+            "expiresIn": MOVIE_TTL
+        }
+        
+        response = jsonify(response_data)
+        per_user_response_cache[cache_key] = response
+        return response
+
+    except KeyError:
+        return jsonify({"error": "Missing 'movieId' in request body"}), 400
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        return jsonify({"error": "Internal server error during movie signing"}), 500
 
 
-@app.route("/get_clip_url", methods=["POST"])
-def get_clip_url():
-    payload = request.get_json() or {}
-    file_name = payload.get("file")
-    if not file_name:
-        return jsonify({"error": "Missing file"}), 400
-    try:
-        signed_url = generate_signed_url(file_name, CLIP_VALID_SECONDS)
-        return jsonify({"url": signed_url, "expiresIn": CLIP_VALID_SECONDS}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/get_bulk_previews", methods=["POST"])
-def get_bulk_previews():
-    payload = request.get_json() or {}
-    folder = payload.get("folder", "posters/")
-
-    try:
-        auth_data = authorize_b2_cached()
-        files = list_files_cached(auth_data, folder)
-
-        def make_url(f):
-            fn = f["fileName"]
-            if not fn.lower().endswith((".jpg", ".png", ".jpeg", ".webp")):
-                return None
-            return {"file": fn, "url": generate_signed_url(fn, POSTER_VALID_SECONDS, auth_data)}
-
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            previews = [r for r in executor.map(make_url, files) if r]
-
-        return jsonify({
-            "count": len(previews),
-            "previews": previews,
-            "expiresIn": POSTER_VALID_SECONDS
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/get_series_signed_urls", methods=["POST"])
-def get_series_signed_urls():
-    user, err, code = require_firebase_user()
+@app.post("/sign/series")
+def sign_series():
+    """Signs all episode files for a given season, accepting separate IDs."""
+    uid, err, code = require_auth()
     if err: return err, code
 
-    payload = request.get_json() or {}
-    folder = payload.get("folder")
-    item_id = payload.get("itemId")
-    season = payload.get("season")
-    if not folder or not item_id or not season:
-        return jsonify({"error": "Missing folder, itemId or season"}), 400
-
-    uid = user["uid"]
-    purchase = db.collection("purchases") \
-        .where("userId", "==", uid) \
-        .where("itemId", "==", item_id) \
-        .where("itemType", "==", "series") \
-        .where("season", "==", int(season)) \
-        .where("status", "==", "completed") \
-        .limit(1).get()
-    if not purchase:
-        return jsonify({"error": "Season not purchased"}), 403
-
     try:
-        auth_data = authorize_b2_cached()
-        files = list_files_cached(auth_data, folder)
+        series_id = request.json["seriesId"]
+        season_doc_id = request.json["seasonId"] 
+        
+        cache_key = f"series_{uid}_{series_id}_{season_doc_id}"
+        if cache_key in per_user_response_cache:
+            return per_user_response_cache[cache_key]
 
-        def make_url(f):
-            fn = f["fileName"]
-            if not fn.lower().endswith((".mp4", ".mkv", ".mov")):
-                return None
-            return {"file": fn, "url": generate_signed_url(fn, SERIES_VALID_SECONDS, auth_data)}
+        # Check Entitlement (season_doc_id is the content_id for season checks)
+        assert_entitlement(uid, season_doc_id, "season", series_id=series_id)
 
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            urls = [r for r in executor.map(make_url, files) if r]
+        episodes = get_episodes(series_id, season_doc_id)
+        if not episodes:
+             return jsonify({"error": "No public episodes found for this season."}), 404
 
-        return jsonify({
-            "season": season,
-            "urls": urls,
-            "expiresIn": SERIES_VALID_SECONDS
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        with ThreadPoolExecutor(MAX_THREADS) as ex:
+            data = list(ex.map(
+                lambda ep: {
+                    "title": ep.get("title", "Episode"),
+                    "episodeId": ep.get("episodeId", "N/A"),
+                    "url": sign_b2(ep["videoPath"], SERIES_TTL)
+                },
+                episodes
+            ))
+
+        response_data = {
+            "seriesId": series_id,
+            "seasonId": season_doc_id,
+            "episodes": data,
+            "expiresIn": SERIES_TTL
+        }
+        
+        response = jsonify(response_data)
+        per_user_response_cache[cache_key] = response
+        return response
+        
+    except KeyError:
+        return jsonify({"error": "Missing 'seriesId' or 'seasonId' in request body"}), 400
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        return jsonify({"error": "Internal server error during series signing"}), 500
 
 
-@app.route("/get_collection_signed_urls", methods=["POST"])
-def get_collection_signed_urls():
-    user, err, code = require_firebase_user()
+@app.post("/sign/collection")
+def sign_collection():
+    """Signs all movie files in a collection with per-user caching."""
+    uid, err, code = require_auth()
     if err: return err, code
 
-    payload = request.get_json() or {}
-    folder = payload.get("folder")
-    item_id = payload.get("itemId")
-    if not folder or not item_id:
-        return jsonify({"error": "Missing folder or itemId"}), 400
+    try:
+        collection_id = request.json["collectionId"]
+        
+        cache_key = f"collection_{uid}_{collection_id}"
+        if cache_key in per_user_response_cache:
+            return per_user_response_cache[cache_key]
 
-    uid = user["uid"]
-    purchase = db.collection("purchases") \
-        .where("userId", "==", uid) \
-        .where("itemId", "==", item_id) \
-        .where("itemType", "==", "collection") \
-        .where("status", "==", "completed") \
-        .limit(1).get()
-    if not purchase:
-        return jsonify({"error": "Collection not purchased"}), 403
+        # Check Entitlement
+        assert_entitlement(uid, collection_id, "collection")
+
+        movies = get_collection_movies(collection_id)
+        if not movies:
+             return jsonify({"error": "Collection found, but contains no movies."}), 404
+
+        with ThreadPoolExecutor(MAX_THREADS) as ex:
+            data = list(ex.map(
+                lambda m: {
+                    "movieId": m.get("movieId", "N/A"),
+                    "url": sign_b2(m["videoPath"], COLLECTION_TTL)
+                },
+                movies
+            ))
+
+        response_data = {
+            "collectionId": collection_id,
+            "movies": data,
+            "expiresIn": COLLECTION_TTL
+        }
+        
+        response = jsonify(response_data)
+        per_user_response_cache[cache_key] = response
+        return response
+        
+    except KeyError:
+        return jsonify({"error": "Missing 'collectionId' in request body"}), 400
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        return jsonify({"error": "Internal server error during collection signing"}), 500
+
+
+@app.post("/sign/collection/movie")
+def sign_collection_movie():
+    """Signs a single movie file, checking entitlement via collection OR single movie purchase."""
+    uid, err, code = require_auth()
+    if err: return err, code
 
     try:
-        auth_data = authorize_b2_cached()
-        files = list_files_cached(auth_data, folder)
+        movie_id = request.json["movieId"]
+        collection_id = request.json.get("collectionId")
 
-        def make_url(f):
-            fn = f["fileName"]
-            if not fn.lower().endswith((".mp4", ".mkv", ".mov")):
-                return None
-            return {"file": fn, "url": generate_signed_url(fn, SERIES_VALID_SECONDS, auth_data)}
+        if not collection_id:
+             return jsonify({"error": "Missing 'collectionId' in request body"}), 400
 
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            urls = [r for r in executor.map(make_url, files) if r]
+        cache_key = f"collmovie_{uid}_{movie_id}_{collection_id}"
+        if cache_key in per_user_response_cache:
+            return per_user_response_cache[cache_key]
 
-        return jsonify({
-            "collection": os.path.basename(folder.strip("/")),
-            "count": len(urls),
-            "urls": urls,
-            "expiresIn": SERIES_VALID_SECONDS
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Check Entitlement (collection_id is the primary content_id, movie_id is the secondary check)
+        assert_entitlement(uid, collection_id, "collectionMovie", movie_id=movie_id) 
+
+        movie_data = get_movie(movie_id) 
+
+        response_data = {
+            "url": sign_b2(movie_data["videoPath"], MOVIE_TTL),
+            "expiresIn": MOVIE_TTL
+        }
+        
+        response = jsonify(response_data)
+        per_user_response_cache[cache_key] = response
+        return response
+        
+    except KeyError as e:
+        return jsonify({"error": f"Missing required field: {e}"}), 400
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        return jsonify({"error": "Internal server error during collection movie signing"}), 500
 
 
-@app.route("/")
+@app.get("/")
 def health():
-    return jsonify({"status": "ok"}), 200
-
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
+    """Health check endpoint."""
+    return {"status": "ok"}
