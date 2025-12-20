@@ -180,6 +180,128 @@ def sign_movie():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+@app.post("/sign/series")
+def sign_series():
+    uid, is_admin, err, code = require_auth()
+    if err: return err, code
+
+    try:
+        series_id = request.json["seriesId"]
+        season_id = request.json["seasonId"]
+
+        # entitlement: season OR series
+        assert_entitlement(
+            uid,
+            is_admin,
+            content_id=season_id,
+            content_type="season",
+            series_id=series_id
+        )
+
+        episodes = db.collection("series") \
+            .document(series_id) \
+            .collection("seasons") \
+            .document(season_id) \
+            .collection("episodes") \
+            .stream()
+
+        signed = []
+        for ep in episodes:
+            data = ep.to_dict()
+            signed.append({
+                "episodeId": ep.id,
+                "title": data.get("title"),
+                "url": sign_b2(data["videoPath"], SERIES_TTL),
+                "expiresIn": SERIES_TTL
+            })
+
+        return jsonify({
+            "seriesId": series_id,
+            "seasonId": season_id,
+            "episodes": signed,
+            "expiresIn": SERIES_TTL
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.post("/sign/collection")
+def sign_collection():
+    uid, is_admin, err, code = require_auth()
+    if err: return err, code
+
+    try:
+        collection_id = request.json["collectionId"]
+
+        assert_entitlement(
+            uid,
+            is_admin,
+            content_id=collection_id,
+            content_type="collection"
+        )
+
+        coll = db.collection("collections").document(collection_id).get()
+        if not coll.exists:
+            return jsonify({"error": "Not found"}), 404
+
+        movies = coll.to_dict().get("movies", [])
+        signed = []
+
+        for m in movies:
+            signed.append({
+                "movieId": m["movieId"],
+                "url": sign_b2(m["videoPath"], COLLECTION_TTL),
+                "expiresIn": COLLECTION_TTL
+            })
+
+        return jsonify({
+            "collectionId": collection_id,
+            "movies": signed,
+            "expiresIn": COLLECTION_TTL
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+        
+@app.post("/sign/collection/movie")
+def sign_collection_movie():
+    uid, is_admin, err, code = require_auth()
+    if err: return err, code
+
+    try:
+        movie_id = request.json["movieId"]
+        collection_id = request.json["collectionId"]
+
+        assert_entitlement(
+            uid,
+            is_admin,
+            content_id=collection_id,
+            content_type="collectionMovie",
+            movie_id=movie_id
+        )
+
+        coll = db.collection("collections").document(collection_id).get()
+        if not coll.exists:
+            return jsonify({"error": "Not found"}), 404
+
+        movie = next(
+            (m for m in coll.to_dict().get("movies", []) if m["movieId"] == movie_id),
+            None
+        )
+
+        if not movie:
+            return jsonify({"error": "Movie not in collection"}), 404
+
+        return jsonify({
+            "movieId": movie_id,
+            "url": sign_b2(movie["videoPath"], MOVIE_TTL),
+            "expiresIn": MOVIE_TTL
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
 @app.delete("/content/movie/<movie_id>")
 def delete_movie(movie_id):
     uid, is_admin, err, code = require_auth()
@@ -229,3 +351,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
