@@ -25,7 +25,6 @@ MOVIE_TTL = 14400        # 4 hours
 SERIES_TTL = 86400       # 24 hours
 COLLECTION_TTL = 86400   # 24 hours
 MAX_THREADS = 10
-PER_USER_RESPONSE_TTL = 600 
 
 # Initialize Firebase
 try:
@@ -43,7 +42,7 @@ CORS(app)
 # --- CACHING ---
 b2_auth_cache = {"expires": datetime.min, "data": None}
 signed_url_cache = TTLCache(maxsize=5000, ttl=max(MOVIE_TTL, SERIES_TTL))
-per_user_response_cache = TTLCache(maxsize=2000, ttl=PER_USER_RESPONSE_TTL)
+user_purchase_cache = TTLCache(maxsize=2000, ttl=60)
 
 # --- AUTH & ENTITLEMENT ---
 
@@ -61,34 +60,46 @@ def require_auth() -> Tuple[Optional[str], bool, Optional[Response], Optional[in
     except Exception:
         return None, False, jsonify({"error": "Auth failed"}), 401
 
-def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: str, series_id: Optional[str] = None, movie_id: Optional[str] = None):
-    """Checks purchase record OR Admin bypass."""
-    if is_admin: return # Admins can watch anything
+def get_user_purchases(uid: str) -> List[Dict]:
+    """Retrieves all completed purchases for a user (1 Firestore Read)."""
+    if uid in user_purchase_cache:
+        return user_purchase_cache[uid]
+    
+    # Single read: Fetch all completed items at once
+    snaps = db.collection("users").document(uid).collection("purchases")\
+              .where("purchaseStatus", "==", "complete").get()
+    
+    purchases = [s.to_dict() for s in snaps]
+    user_purchase_cache[uid] = purchases
+    return purchases
 
-    purchases_ref = db.collection("users").document(uid).collection("purchases")\
-                      .where("purchaseStatus", "==", "complete")
+def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: str, parent_id: Optional[str] = None):
+    """Refactored: Uses 1 read max by validating in-memory."""
+    if is_admin: return 
+
+    purchases = get_user_purchases(uid)
+    is_entitled = False
 
     if content_type == "season":
-        snaps = purchases_ref.where("itemType", "in", ["series", "season"]).get()
+        # Check if they own this season OR the parent series
         is_entitled = any(
-            (s.to_dict()["itemId"] == series_id and s.to_dict()["itemType"] == "series") or
-            (s.to_dict()["itemId"] == content_id and s.to_dict()["itemType"] == "season")
-            for s in snaps
+            (p["itemId"] == content_id and p["itemType"] == "season") or
+            (parent_id and p["itemId"] == parent_id and p["itemType"] == "series")
+            for p in purchases
         )
     elif content_type == "collectionMovie":
-        snaps = purchases_ref.where("itemType", "in", ["collection", "collectionMovie"]).get()
+        # Check if they own this movie OR the parent collection
         is_entitled = any(
-            (s.to_dict()["itemId"] == content_id and s.to_dict()["itemType"] == "collection") or
-            (s.to_dict()["itemId"] == movie_id and s.to_dict()["itemType"] == "collectionMovie")
-            for s in snaps
+            (p["itemId"] == content_id and p["itemType"] == "collectionMovie") or
+            (parent_id and p["itemId"] == parent_id and p["itemType"] == "collection")
+            for p in purchases
         )
     else:
-        snap = purchases_ref.where("itemId", "==", content_id).where("itemType", "==", content_type).limit(1).get()
-        is_entitled = len(snap) > 0
+        # Standard check (movie, series, collection)
+        is_entitled = any(p["itemId"] == content_id and p["itemType"] == content_type for p in purchases)
 
     if not is_entitled:
         raise PermissionError(f"Access denied to {content_type} {content_id}")
-
 # --- B2 CORE HELPERS ---
 
 def authorize_b2():
@@ -190,14 +201,8 @@ def sign_series():
         season_id = request.json["seasonId"]
 
         # entitlement: season OR series
-        assert_entitlement(
-            uid,
-            is_admin,
-            content_id=season_id,
-            content_type="season",
-            series_id=series_id
-        )
-
+        assert_entitlement(uid, is_admin, season_id, "season", parent_id=series_id)
+        
         episodes = db.collection("series") \
             .document(series_id) \
             .collection("seasons") \
@@ -232,13 +237,7 @@ def sign_collection():
 
     try:
         collection_id = request.json["collectionId"]
-
-        assert_entitlement(
-            uid,
-            is_admin,
-            content_id=collection_id,
-            content_type="collection"
-        )
+        assert_entitlement(uid, is_admin, collection_id, "collection")
 
         coll = db.collection("collections").document(collection_id).get()
         if not coll.exists:
@@ -271,15 +270,8 @@ def sign_collection_movie():
     try:
         movie_id = request.json["movieId"]
         collection_id = request.json["collectionId"]
-
-        assert_entitlement(
-            uid,
-            is_admin,
-            content_id=collection_id,
-            content_type="collectionMovie",
-            movie_id=movie_id
-        )
-
+        assert_entitlement(uid, is_admin, movie_id, "collectionMovie", parent_id=collection_id)
+        
         coll = db.collection("collections").document(collection_id).get()
         if not coll.exists:
             return jsonify({"error": "Not found"}), 404
@@ -351,4 +343,5 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
