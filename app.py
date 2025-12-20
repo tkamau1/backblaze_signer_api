@@ -41,7 +41,9 @@ CORS(app)
 
 # --- CACHING ---
 b2_auth_cache = {"expires": datetime.min, "data": None}
-signed_url_cache = TTLCache(maxsize=5000, ttl=max(MOVIE_TTL, SERIES_TTL))
+# Set the TTLCache to 18 hours (64800 seconds)
+# This is the "secret sauce": Python expires its cache BEFORE Flutter's 20h buffer
+signed_url_cache = TTLCache(maxsize=5000, ttl=64800)
 user_purchase_cache = TTLCache(maxsize=2000, ttl=60)
 
 # --- AUTH & ENTITLEMENT ---
@@ -343,6 +345,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
