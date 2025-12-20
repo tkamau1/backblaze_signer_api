@@ -21,7 +21,7 @@ B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
 
 # Signed URL TTLs
-MOVIE_TTL = 14400        # 4 hours
+MOVIE_TTL = 86400        # 24 hours
 SERIES_TTL = 86400       # 24 hours
 COLLECTION_TTL = 86400   # 24 hours
 MAX_THREADS = 10
@@ -343,5 +343,6 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
