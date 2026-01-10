@@ -477,7 +477,13 @@ def mpesa_callback():
                     "timestamp": firestore.SERVER_TIMESTAMP
                 })
             else:
-                payment_doc.reference.update({"status": "FAILED", "errorCode": result_code})
+                result_desc = data.get("ResultDesc", "Payment failed")
+                payment_doc.reference.update({
+                    "status": "FAILED",
+                    "errorCode": result_code,
+                    "errorMessage": result_desc,
+                    "updatedAt": firestore.SERVER_TIMESTAMP
+                })
                 print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
 
         return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
@@ -514,6 +520,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
