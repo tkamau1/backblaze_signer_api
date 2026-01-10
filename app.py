@@ -455,6 +455,7 @@ def mpesa_callback():
         
         if payment_query:
             payment_doc = payment_query[0]
+            pay_data = payment_doc.to_dict()
             uid = payment_doc.reference.parent.parent.id
             
             if result_code == 0:
@@ -520,6 +521,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
