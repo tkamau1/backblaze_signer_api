@@ -28,6 +28,7 @@ MPESA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/call
 MPESA_STORE_NUMBER = os.getenv("MPESA_STORE_NUMBER") # Business ShortCode
 MPESA_TILL_NUMBER = os.getenv("MPESA_TILL_NUMBER")   # The actual Till
 MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
+MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for sandbox, while CustomerBuyGoodsOnline for Live
 
 # Signed URL TTLs
 MOVIE_TTL = 86400        # 24 hours
@@ -409,7 +410,7 @@ def mpesa_stk_push():
         "BusinessShortCode": MPESA_STORE_NUMBER, # The Store Number
         "Password": password,
         "Timestamp": timestamp,
-        "TransactionType": "CustomerBuyGoodsOnline", # CRITICAL for Till
+        "TransactionType": MPESA_TRANSACTION_TYPE, # CRITICAL for Till/ Paybill for sandbox
         "Amount": amount,
         "PartyA": phone, # Customer phone
         "PartyB": MPESA_TILL_NUMBER, # The actual Till Number
@@ -504,4 +505,5 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
