@@ -378,6 +378,7 @@ def mpesa_stk_push():
     if err: return err, code
 
     data = request.json
+    print(f"DEBUG: Incoming Flutter Data: {data}")
     phone = data["phone"] 
     amount = int(data["amount"])
     item_id = data["item_id"]
@@ -386,6 +387,11 @@ def mpesa_stk_push():
     # 1. Get Access Token (Standard for all M-Pesa APIs)
     api_url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
     r = requests.get(api_url, auth=HTTPBasicAuth(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET))
+    
+    if r.status_code != 200:
+        print(f"DEBUG: Token Error: {r.text}")
+        return jsonify({"error": "Failed to get access token"}), 500
+        
     access_token = r.json()['access_token']
 
     # 2. Generate Password using STORE_NUMBER (BusinessShortCode)
@@ -396,6 +402,8 @@ def mpesa_stk_push():
     # 3. Request STK Push for Buy Goods (Till)
     stk_url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
     headers = {"Authorization": f"Bearer {access_token}"}
+
+    safe_ref = item_name.replace(" ", "")[:12] if item_name else "Payment"
     
     payload = {
         "BusinessShortCode": MPESA_STORE_NUMBER, # The Store Number
@@ -407,13 +415,15 @@ def mpesa_stk_push():
         "PartyB": MPESA_TILL_NUMBER, # The actual Till Number
         "PhoneNumber": phone,
         "CallBackURL": MPESA_CALLBACK_URL,
-        "AccountReference": item_name[:12],
+        "AccountReference": safe_ref,
         "TransactionDesc": f"Payment for {item_id}"
     }
 
+    print(f"DEBUG: Safaricom Request Payload: {payload}")
     res = requests.post(stk_url, json=payload, headers=headers)
     res_data = res.json()
-
+    
+    print(f"DEBUG: Safaricom RAW Response: {res_data}")
     if res.status_code == 200:
         checkout_id = res_data["CheckoutRequestID"]
         # Save to Firestore so Flutter Stream hears it
@@ -432,37 +442,60 @@ def mpesa_stk_push():
     
 @app.post("/v1/payments/callback")
 def mpesa_callback():
-    data = request.json["Body"]["stkCallback"]
-    checkout_id = data["CheckoutRequestID"]
-    result_code = data["ResultCode"]
-
-    # Find the user who owns this checkout ID
-    # Note: In production, store mapping of CheckoutID -> UID for faster lookup
-    payment_query = db.collection_group("payments").where("checkoutRequestId", "==", checkout_id).limit(1).get()
+    # LOG: See what Safaricom sends back after payment
+    print(f"DEBUG: Mpesa Callback Received: {request.json}")
     
-    if payment_query:
-        payment_doc = payment_query[0]
-        uid = payment_doc.reference.parent.parent.id # Get UID from path
+    try:
+        data = request.json["Body"]["stkCallback"]
+        checkout_id = data["CheckoutRequestID"]
+        result_code = data["ResultCode"]
+
+        payment_query = db.collection_group("payments").where("checkoutRequestId", "==", checkout_id).limit(1).get()
         
-        if result_code == 0:
-            # Payment Success
-            payment_doc.reference.update({"status": "COMPLETED", "completedAt": firestore.SERVER_TIMESTAMP})
+        if payment_query:
+            payment_doc = payment_query[0]
+            uid = payment_doc.reference.parent.parent.id
             
-            # Add to User Purchases
-            pay_data = payment_doc.to_dict()
-            db.collection("users").document(uid).collection("purchases").add({
-                "itemId": pay_data["itemId"],
-                "itemName": pay_data["itemName"],
-                "purchaseStatus": "complete",
-                "timestamp": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            # Payment Failed/Cancelled
-            payment_doc.reference.update({"status": "FAILED", "errorCode": result_code})
+            if result_code == 0:
+                payment_doc.reference.update({"status": "COMPLETED", "completedAt": firestore.SERVER_TIMESTAMP})
+                pay_data = payment_doc.to_dict()
+                db.collection("users").document(uid).collection("purchases").add({
+                    "itemId": pay_data["itemId"],
+                    "itemName": pay_data["itemName"],
+                    "purchaseStatus": "complete",
+                    "timestamp": firestore.SERVER_TIMESTAMP
+                })
+                print(f"DEBUG: Payment {checkout_id} marked as SUCCESS")
+            else:
+                payment_doc.reference.update({"status": "FAILED", "errorCode": result_code})
+                print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
 
-    return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+    except Exception as e:
+        print(f"DEBUG: Callback processing error: {e}")
+        return jsonify({"ResultCode": 1, "ResultDesc": "Internal Error"}), 500
 
+@app.get("/v1/debug/config-check")
+def config_check():
+    """Checks if Environment Variables are loaded without showing full secrets."""
+    uid, is_admin, err, code = require_auth()
+    if err or not is_admin: 
+        return jsonify({"error": "Admin only"}), 403
 
+    config_status = {
+        "MPESA_CONSUMER_KEY_LOADED": bool(os.getenv("MPESA_CONSUMER_KEY")),
+        "MPESA_CONSUMER_SECRET_LOADED": bool(os.getenv("MPESA_CONSUMER_SECRET")),
+        "MPESA_PASSKEY_LOADED": bool(os.getenv("MPESA_PASSKEY")),
+        "MPESA_STORE_NUMBER": os.getenv("MPESA_STORE_NUMBER"),
+        "MPESA_TILL_NUMBER": os.getenv("MPESA_TILL_NUMBER"),
+        "FIREBASE_SECRET_FILE_EXISTS": os.path.exists("/etc/secrets/serviceAccountKey.json"),
+        "ENV_MODE": "Production" if os.getenv("RENDER") else "Local"
+    }
+    
+    # Log it to Render console too
+    print(f"DEBUG CONFIG CHECK: {config_status}")
+    return jsonify(config_status)
+    
 @app.get("/health")
 @app.get("/")
 def health():
@@ -471,3 +504,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
