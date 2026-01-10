@@ -36,13 +36,24 @@ COLLECTION_TTL = 86400   # 24 hours
 MAX_THREADS = 10
 
 # Initialize Firebase
-try:
-    # Path for Render Secret File
-    cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
+firebase_cert_path = "/etc/secrets/serviceAccountKey.json"
+
+if os.path.exists(firebase_cert_path):
+    # Production (Render)
+    cred = credentials.Certificate(firebase_cert_path)
     firebase_admin.initialize_app(cred)
-except Exception:
-    # Fallback for local testing
-    firebase_admin.initialize_app()
+    print("Firebase initialized with Service Account.")
+else:
+    # Local Development
+    try:
+        # If you have the file locally in your project folder
+        cred = credentials.Certificate("serviceAccountKey.json")
+        firebase_admin.initialize_app(cred)
+        print("Firebase initialized with local JSON.")
+    except Exception:
+        # Last resort: Application Default Credentials
+        firebase_admin.initialize_app()
+        print("Firebase initialized with Default Credentials.")
     
 db = firestore.client()
 app = Flask(__name__)
@@ -471,6 +482,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
