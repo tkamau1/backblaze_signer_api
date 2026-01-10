@@ -458,15 +458,24 @@ def mpesa_callback():
             uid = payment_doc.reference.parent.parent.id
             
             if result_code == 0:
-                payment_doc.reference.update({"status": "COMPLETED", "completedAt": firestore.SERVER_TIMESTAMP})
-                pay_data = payment_doc.to_dict()
+                # Safaricom sends metadata in a list of Key-Value pairs
+                metadata = data.get("CallbackMetadata", {}).get("Item", [])
+                receipt = next((item["Value"] for item in metadata if item["Name"] == "MpesaReceiptNumber"), "UNKNOWN")
+                
+                payment_doc.reference.update({
+                    "status": "COMPLETED", 
+                    "completedAt": firestore.SERVER_TIMESTAMP,
+                    "mpesaReceipt": receipt # Save the actual M-Pesa code
+                })
+                
+                # Also add it to the purchase record
                 db.collection("users").document(uid).collection("purchases").add({
                     "itemId": pay_data["itemId"],
                     "itemName": pay_data["itemName"],
                     "purchaseStatus": "complete",
+                    "mpesaReceipt": receipt,
                     "timestamp": firestore.SERVER_TIMESTAMP
                 })
-                print(f"DEBUG: Payment {checkout_id} marked as SUCCESS")
             else:
                 payment_doc.reference.update({"status": "FAILED", "errorCode": result_code})
                 print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
@@ -505,5 +514,6 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
