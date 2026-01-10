@@ -8,10 +8,9 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 from cachetools import TTLCache
+
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
-import base64
-from requests.auth import HTTPBasicAuth
 
 load_dotenv()
 
@@ -21,14 +20,6 @@ B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
 
-# --- MPESA CONFIG ---
-MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
-MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET")
-MPESA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/callback"
-MPESA_STORE_NUMBER = os.getenv("MPESA_STORE_NUMBER") # Business ShortCode
-MPESA_TILL_NUMBER = os.getenv("MPESA_TILL_NUMBER")   # The actual Till
-MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
-
 # Signed URL TTLs
 MOVIE_TTL = 86400        # 24 hours
 SERIES_TTL = 86400       # 24 hours
@@ -36,24 +27,13 @@ COLLECTION_TTL = 86400   # 24 hours
 MAX_THREADS = 10
 
 # Initialize Firebase
-firebase_cert_path = "/etc/secrets/serviceAccountKey.json"
-
-if os.path.exists(firebase_cert_path):
-    # Production (Render)
-    cred = credentials.Certificate(firebase_cert_path)
+try:
+    # Path for Render Secret File
+    cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
-    print("Firebase initialized with Service Account.")
-else:
-    # Local Development
-    try:
-        # If you have the file locally in your project folder
-        cred = credentials.Certificate("serviceAccountKey.json")
-        firebase_admin.initialize_app(cred)
-        print("Firebase initialized with local JSON.")
-    except Exception:
-        # Last resort: Application Default Credentials
-        firebase_admin.initialize_app()
-        print("Firebase initialized with Default Credentials.")
+except Exception:
+    # Fallback for local testing
+    firebase_admin.initialize_app()
     
 db = firestore.client()
 app = Flask(__name__)
@@ -357,123 +337,6 @@ def purge_orphans():
     
     return jsonify({"mode": "LIVE PURGE", "deleted": results.count(True), "failed": results.count(False)})
 
-@app.post("/v1/auth/b2-token")
-def get_b2_upload_token():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
-    
-    try:
-        # B2 Authorize
-        auth_data = authorize_b2()
-        
-        # Get Upload URL for the specific bucket
-        r = requests.post(
-            f"{auth_data['apiUrl']}/b2api/v2/b2_get_upload_url",
-            headers={"Authorization": auth_data["authorizationToken"]},
-            json={"bucketId": B2_BUCKET_ID}
-        )
-        r.raise_for_status()
-        data = r.json()
-        
-        # Return what the DirectUploadService expects
-        return jsonify({
-            "uploadUrl": data["uploadUrl"],
-            "uploadAuthToken": data["authorizationToken"]
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.post("/v1/payments/stk-push")
-def mpesa_stk_push():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
-
-    data = request.json
-    phone = data["phone"] 
-    amount = int(data["amount"])
-    item_id = data["item_id"]
-    item_name = data["item_name"]
-
-    # 1. Get Access Token (Standard for all M-Pesa APIs)
-    api_url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
-    r = requests.get(api_url, auth=HTTPBasicAuth(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET))
-    access_token = r.json()['access_token']
-
-    # 2. Generate Password using STORE_NUMBER (BusinessShortCode)
-    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    pass_str = f"{MPESA_STORE_NUMBER}{MPESA_PASSKEY}{timestamp}"
-    password = base64.b64encode(pass_str.encode()).decode()
-
-    # 3. Request STK Push for Buy Goods (Till)
-    stk_url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    
-    payload = {
-        "BusinessShortCode": MPESA_STORE_NUMBER, # The Store Number
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerBuyGoodsOnline", # CRITICAL for Till
-        "Amount": amount,
-        "PartyA": phone, # Customer phone
-        "PartyB": MPESA_TILL_NUMBER, # The actual Till Number
-        "PhoneNumber": phone,
-        "CallBackURL": MPESA_CALLBACK_URL,
-        "AccountReference": item_name[:12],
-        "TransactionDesc": f"Payment for {item_id}"
-    }
-
-    res = requests.post(stk_url, json=payload, headers=headers)
-    res_data = res.json()
-
-    if res.status_code == 200:
-        checkout_id = res_data["CheckoutRequestID"]
-        # Save to Firestore so Flutter Stream hears it
-        db.collection("users").document(uid).collection("payments").document(checkout_id).set({
-            "itemId": item_id,
-            "itemName": item_name,
-            "amount": amount,
-            "status": "PENDING",
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "checkoutRequestId": checkout_id,
-            "paymentType": "till_buy_goods"
-        })
-        return jsonify(res_data)
-    
-    return jsonify({"error": "Mpesa request failed", "details": res_data}), 400
-    
-@app.post("/v1/payments/callback")
-def mpesa_callback():
-    data = request.json["Body"]["stkCallback"]
-    checkout_id = data["CheckoutRequestID"]
-    result_code = data["ResultCode"]
-
-    # Find the user who owns this checkout ID
-    # Note: In production, store mapping of CheckoutID -> UID for faster lookup
-    payment_query = db.collection_group("payments").where("checkoutRequestId", "==", checkout_id).limit(1).get()
-    
-    if payment_query:
-        payment_doc = payment_query[0]
-        uid = payment_doc.reference.parent.parent.id # Get UID from path
-        
-        if result_code == 0:
-            # Payment Success
-            payment_doc.reference.update({"status": "COMPLETED", "completedAt": firestore.SERVER_TIMESTAMP})
-            
-            # Add to User Purchases
-            pay_data = payment_doc.to_dict()
-            db.collection("users").document(uid).collection("purchases").add({
-                "itemId": pay_data["itemId"],
-                "itemName": pay_data["itemName"],
-                "purchaseStatus": "complete",
-                "timestamp": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            # Payment Failed/Cancelled
-            payment_doc.reference.update({"status": "FAILED", "errorCode": result_code})
-
-    return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-
 @app.get("/health")
 @app.get("/")
 def health():
@@ -482,9 +345,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
