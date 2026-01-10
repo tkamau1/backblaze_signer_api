@@ -384,6 +384,7 @@ def mpesa_stk_push():
     amount = int(data["amount"])
     item_id = data["item_id"]
     item_name = data["item_name"]
+    item_type = data["item_type"]
 
     # 1. Get Access Token (Standard for all M-Pesa APIs)
     api_url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
@@ -431,6 +432,7 @@ def mpesa_stk_push():
         db.collection("users").document(uid).collection("payments").document(checkout_id).set({
             "itemId": item_id,
             "itemName": item_name,
+            "item_type": item_type,
             "amount": amount,
             "status": "PENDING",
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -465,18 +467,22 @@ def mpesa_callback():
                 
                 payment_doc.reference.update({
                     "status": "COMPLETED", 
-                    "completedAt": firestore.SERVER_TIMESTAMP,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
                     "mpesaReceipt": receipt # Save the actual M-Pesa code
                 })
                 
                 # Also add it to the purchase record
                 db.collection("users").document(uid).collection("purchases").add({
+                    "amount": pay_data.get("amount"),
+                    "currency": "KES",
                     "itemId": pay_data["itemId"],
-                    "itemName": pay_data["itemName"],
+                    "itemType": pay_data["itemType"],
+                    "paymentMethod": "M-PESA",
+                    "purchaseDate": firestore.SERVER_TIMESTAMP,
                     "purchaseStatus": "complete",
-                    "mpesaReceipt": receipt,
-                    "timestamp": firestore.SERVER_TIMESTAMP
+                    "receiptData": receipt,
                 })
+    
             else:
                 result_desc = data.get("ResultDesc", "Payment failed")
                 payment_doc.reference.update({
@@ -521,6 +527,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
