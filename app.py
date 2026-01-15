@@ -16,10 +16,15 @@ from requests.auth import HTTPBasicAuth
 load_dotenv()
 
 # --- CONFIGURATION ---
-B2_KEY_ID = os.getenv("B2_KEY_ID")
-B2_APP_KEY = os.getenv("B2_APPLICATION_KEY")
-B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
-B2_BUCKET_ID = os.getenv("B2_BUCKET_ID")
+B2_PRIVATE_KEY_ID = os.getenv("B2_PRIVATE_KEY_ID")
+B2_PRIVATE_APP_KEY = os.getenv("B2_PRIVATE_APPLICATION_KEY")
+# Primary Private Bucket (Videos)
+B2_PRIVATE_BUCKET_NAME = os.getenv("B2_PRIVATE_BUCKET_NAME")
+B2_PRIVATE_BUCKET_ID = os.getenv("B2_PRIVATE_BUCKET_ID")
+
+# Public Bucket (Posters)
+B2_PUBLIC_BUCKET_NAME = os.getenv("B2_PUBLIC_BUCKET_NAME") 
+B2_PUBLIC_BUCKET_ID = os.getenv("B2_PUBLIC_BUCKET_ID")
 
 # --- MPESA CONFIG ---
 MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
@@ -114,11 +119,13 @@ def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: 
         raise PermissionError(f"Access denied to {content_type} {content_id}")
 # --- B2 CORE HELPERS ---
 
-def authorize_b2():
+def authorize_b2(is_public=False)):
     global b2_auth_cache
     if datetime.utcnow() < b2_auth_cache["expires"]:
         return b2_auth_cache["data"]
-    r = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", auth=(B2_KEY_ID, B2_APP_KEY))
+    key_id = os.getenv("B2_PUBLIC_KEY_ID") if is_public else os.getenv("B2_PRIVATE_KEY_ID")
+    app_key = os.getenv("B2_PUBLIC_APP_KEY") if is_public else os.getenv("B2_PRIVATE_APP_KEY")
+    r = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", auth=(key_id, app_key))
     r.raise_for_status()
     data = r.json()
     b2_auth_cache = {"data": data, "expires": datetime.utcnow() + timedelta(hours=23)}
@@ -130,11 +137,11 @@ def sign_b2(file_path: str, expires: int) -> str:
     r = requests.post(
         f"{auth_data['apiUrl']}/b2api/v2/b2_get_download_authorization",
         headers={"Authorization": auth_data["authorizationToken"]},
-        json={"bucketId": B2_BUCKET_ID, "fileNamePrefix": file_path, "validDurationInSeconds": expires}
+        json={"bucketId": B2_PRIVATE_BUCKET_ID, "fileNamePrefix": file_path, "validDurationInSeconds": expires}
     )
     r.raise_for_status()
     token = r.json()["authorizationToken"]
-    url = f"{auth_data['downloadUrl']}/file/{B2_BUCKET_NAME}/{file_path}?Authorization={token}"
+    url = f"{auth_data['downloadUrl']}/file/{B2_PRIVATE_BUCKET_NAME}/{file_path}?Authorization={token}"
     signed_url_cache[file_path] = url
     return url
 
@@ -157,16 +164,19 @@ def delete_b2_file(file_path: str, file_id: str) -> bool:
 
 def get_all_orphans():
     """Scans B2 and Firestore to find unlinked files."""
-    auth_data = authorize_b2()
+    is_public = data.get('isPublic', False)
+    auth_data = authorize_b2(is_public)
     all_b2_files = {}
     next_file_name = None
 
+    target_bucket = B2_PUBLIC_BUCKET_ID if is_public else B2_PRIVATE_BUCKET_ID
+    
     # Step 1: Paginated B2 Scan
     while True:
         r = requests.post(
             f"{auth_data['apiUrl']}/b2api/v2/b2_list_file_names",
             headers={"Authorization": auth_data["authorizationToken"]},
-            json={"bucketId": B2_BUCKET_ID, "maxFileCount": 1000, "startFileName": next_file_name}
+            json={"bucketId": target_bucket, "maxFileCount": 1000, "startFileName": next_file_name}
         )
         r.raise_for_status()
         data = r.json()
@@ -353,14 +363,16 @@ def get_b2_upload_token():
     if err: return err, code
     
     try:
+        is_public = data.get('isPublic', False)
         # B2 Authorize
-        auth_data = authorize_b2()
+        auth_data = authorize_b2(is_public)
+        target_bucket = B2_PUBLIC_BUCKET_ID if is_public else B2_PRIVATE_BUCKET_ID
         
         # Get Upload URL for the specific bucket
         r = requests.post(
             f"{auth_data['apiUrl']}/b2api/v2/b2_get_upload_url",
             headers={"Authorization": auth_data["authorizationToken"]},
-            json={"bucketId": B2_BUCKET_ID}
+            json={"bucketId": target_bucket}
         )
         r.raise_for_status()
         data = r.json()
@@ -527,6 +539,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
