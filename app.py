@@ -119,7 +119,7 @@ def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: 
         raise PermissionError(f"Access denied to {content_type} {content_id}")
 # --- B2 CORE HELPERS ---
 
-def authorize_b2(is_public=False)):
+def authorize_b2(is_public=False):
     global b2_auth_cache
     if datetime.utcnow() < b2_auth_cache["expires"]:
         return b2_auth_cache["data"]
@@ -539,6 +539,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
