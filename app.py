@@ -18,6 +18,9 @@ load_dotenv()
 # --- CONFIGURATION ---
 B2_PRIVATE_KEY_ID = os.getenv("B2_PRIVATE_KEY_ID")
 B2_PRIVATE_APP_KEY = os.getenv("B2_PRIVATE_APPLICATION_KEY")
+B2_PUBLIC_KEY_ID = os.getenv("B2_PUBLIC_KEY_ID")
+B2_PUBLIC_APP_KEY = os.getenv("B2_PUBLIC_APPLICATION_KEY")
+
 # Primary Private Bucket (Videos)
 B2_PRIVATE_BUCKET_NAME = os.getenv("B2_PRIVATE_BUCKET_NAME")
 B2_PRIVATE_BUCKET_ID = os.getenv("B2_PRIVATE_BUCKET_ID")
@@ -567,6 +570,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
