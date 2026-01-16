@@ -55,8 +55,6 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CACHING ---
-b2_auth_cache = {"expires": datetime.min, "data": None}
-# Set the TTLCache to 18 hours (64800 seconds)
 # This is the "secret sauce": Python expires its cache BEFORE Flutter's 20h buffer
 signed_url_cache = TTLCache(maxsize=5000, ttl=64800)
 user_purchase_cache = TTLCache(maxsize=2000, ttl=60)
@@ -119,26 +117,42 @@ def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: 
         raise PermissionError(f"Access denied to {content_type} {content_id}")
         
 # --- B2 CORE HELPERS ---
-def authorize_b2(is_public=False):
-    global b2_auth_cache
-    if datetime.utcnow() < b2_auth_cache["expires"]:
-        return b2_auth_cache["data"]
+b2_auth_store = {
+    "private": {"expires": datetime.min, "data": None},
+    "public":  {"expires": datetime.min, "data": None}
+}
+# Set the TTLCache to 18 hours (64800 seconds)
 
-    print(f"DEBUG: Authorizing B2 for {'PUBLIC' if is_public else 'PRIVATE'} bucket...")
+def authorize_b2(is_public=False):
+    global b2_auth_store
+    scope_key = "public" if is_public else "private"
+    # Check specific cache for this scope
+    if datetime.utcnow() < b2_auth_store[scope_key]["expires"]:
+        print(f"DEBUG: Using cached B2 auth for {scope_key}")
+        return b2_auth_store[scope_key]["data"]
+    print(f"DEBUG: Authorizing B2 for {scope_key.upper()} bucket...")
     
     key_id = os.getenv("B2_PUBLIC_KEY_ID") if is_public else os.getenv("B2_PRIVATE_KEY_ID")
     app_key = os.getenv("B2_PUBLIC_APP_KEY") if is_public else os.getenv("B2_PRIVATE_APP_KEY")
+    
     if not key_id or not app_key:
-        print(f"ERROR: Missing keys for {'public' if is_public else 'private'} storage")
-        raise ValueError("B2 Keys not found in environment")
-    r = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", auth=(key_id, app_key))
+        print(f"ERROR: Missing keys for {scope_key} storage")
+        raise ValueError(f"B2 Keys not found for {scope_key}")
+    r = requests.get(
+        "https://api.backblazeb2.com/b2api/v2/b2_authorize_account", 
+        auth=(key_id, app_key)
+    )
     
     if r.status_code != 200:
-        print(f"B2 AUTH FAILED: {r.text}") # This will tell you exactly why B2 said no
+        print(f"B2 AUTH FAILED: {r.text}")
         r.raise_for_status()
         
     data = r.json()
-    b2_auth_cache = {"data": data, "expires": datetime.utcnow() + timedelta(hours=23)}
+    # Save to the specific scope key
+    b2_auth_store[scope_key] = {
+        "data": data, 
+        "expires": datetime.utcnow() + timedelta(hours=23)
+    }
     return data
 
 def sign_b2(file_path: str, expires: int) -> str:
@@ -553,6 +567,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
