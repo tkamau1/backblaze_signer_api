@@ -164,7 +164,9 @@ def delete_b2_file(file_path: str, file_id: str) -> bool:
 
 def get_all_orphans():
     """Scans B2 and Firestore to find unlinked files."""
-    is_public = data.get('isPublic', False)
+    data = request.json or {}         
+    is_public = data.get("isPublic", False)
+
     auth_data = authorize_b2(is_public)
     all_b2_files = {}
     next_file_name = None
@@ -363,7 +365,9 @@ def get_b2_upload_token():
     if err: return err, code
     
     try:
-        is_public = data.get('isPublic', False)
+        data = request.json or {}
+        is_public = data.get("isPublic", False)
+        
         # B2 Authorize
         auth_data = authorize_b2(is_public)
         target_bucket = B2_PUBLIC_BUCKET_ID if is_public else B2_PRIVATE_BUCKET_ID
@@ -539,6 +543,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
