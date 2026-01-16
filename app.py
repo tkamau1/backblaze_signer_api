@@ -120,15 +120,30 @@ def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: 
 # --- B2 CORE HELPERS ---
 
 def authorize_b2(is_public=False):
-    global b2_auth_cache
-    if datetime.utcnow() < b2_auth_cache["expires"]:
-        return b2_auth_cache["data"]
+    global b2_auth_caches
+    cache_key = "public" if is_public else "private"
+    
+    if datetime.utcnow() < b2_auth_caches[cache_key]["expires"]:
+        return b2_auth_caches[cache_key]["data"]
+
+    # Debug line - check your Render logs for this!
+    print(f"DEBUG: Authorizing B2 for {'PUBLIC' if is_public else 'PRIVATE'} bucket...")
+
     key_id = os.getenv("B2_PUBLIC_KEY_ID") if is_public else os.getenv("B2_PRIVATE_KEY_ID")
-    app_key = os.getenv("B2_PUBLIC_APP_KEY") if is_public else os.getenv("B2_PRIVATE_APP_KEY")
+    app_key = os.getenv("B2_PUBLIC_APP_KEY") if is_public else os.getenv("B2_PRIVATE_APPLICATION_KEY")
+    
+    if not key_id or not app_key:
+        print(f"ERROR: Missing keys for {'public' if is_public else 'private'} storage")
+        raise ValueError("B2 Keys not found in environment")
+
     r = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", auth=(key_id, app_key))
-    r.raise_for_status()
+    
+    if r.status_code != 200:
+        print(f"B2 AUTH FAILED: {r.text}") # This will tell you exactly why B2 said no
+        r.raise_for_status()
+        
     data = r.json()
-    b2_auth_cache = {"data": data, "expires": datetime.utcnow() + timedelta(hours=23)}
+    b2_auth_caches[cache_key] = {"data": data, "expires": datetime.utcnow() + timedelta(hours=23)}
     return data
 
 def sign_b2(file_path: str, expires: int) -> str:
@@ -543,6 +558,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
