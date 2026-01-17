@@ -561,6 +561,73 @@ def config_check():
     # Log it to Render console too
     print(f"DEBUG CONFIG CHECK: {config_status}")
     return jsonify(config_status)
+
+# --- TV AUTH CONFIG ---
+# We use a short 5-minute window for pairing codes
+DEVICE_CODE_TTL_MINUTES = 5
+
+@app.post("/v1/auth/verify-tv-code")
+def verify_tv_code():
+    """
+    Called by the MOBILE app to approve a code shown on the TV.
+    """
+    # Use your existing auth helper to ensure the Mobile user is logged in
+    uid, is_admin, err, code = require_auth()
+    if err: return err, code
+    
+    try:
+        data = request.json
+        device_code = data.get("code").upper().strip()
+        
+        if not device_code:
+            return jsonify({"error": "Code is required"}), 400
+
+        # 1. Check if the code exists in Firestore
+        code_ref = db.collection('device_auth_requests').document(device_code)
+        doc = code_ref.get()
+        
+        if not doc.exists:
+            return jsonify({"error": "Code not found or expired"}), 404
+            
+        doc_data = doc.to_dict()
+        
+        # 2. Verify expiry (Safety check)
+        created_at = doc_data.get('createdAt')
+        if not created_at:
+            return jsonify({"error": "Invalid code data"}), 400
+            
+        # Check if the code is older than 5 minutes
+        # Note: server_timestamp returns a datetime object in Python
+        now = datetime.now(created_at.tzinfo)
+        if now > created_at + timedelta(minutes=DEVICE_CODE_TTL_MINUTES):
+            code_ref.delete() # Cleanup expired code
+            return jsonify({"error": "Code has expired"}), 403
+
+        if doc_data.get('status') != 'pending':
+             return jsonify({"error": "Code already used or invalid"}), 400
+
+        # 3. MINT CUSTOM TOKEN
+        # Since you are using the Firebase Admin SDK, you CAN create a custom token.
+        # This is allowed on the free tier of Firebase as long as you use the Admin SDK 
+        # inside your own server (Render).
+        custom_token = auth.create_custom_token(uid)
+        
+        if isinstance(custom_token, bytes):
+            custom_token = custom_token.decode('utf-8')
+
+        # 4. Update Firestore to trigger the TV's listener
+        code_ref.update({
+            'status': 'approved',
+            'token': custom_token,
+            'approvedBy': uid,
+            'approvedAt': firestore.SERVER_TIMESTAMP
+        })
+        
+        return jsonify({"success": True, "message": "TV successfully linked!"})
+
+    except Exception as e:
+        print(f"TV Auth Error: {e}")
+        return jsonify({"error": str(e)}), 500
     
 @app.get("/health")
 @app.get("/")
@@ -570,17 +637,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
