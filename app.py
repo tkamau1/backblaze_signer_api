@@ -571,10 +571,15 @@ def verify_tv_code():
     """
     Called by the MOBILE app to approve a code shown on the TV.
     """
+    print("--- DEBUG: verify_tv_code started ---")
+    
     # Use your existing auth helper to ensure the Mobile user is logged in
     uid, is_admin, err, code = require_auth()
-    if err: return err, code
-    
+    if err:
+        print(f"--- DEBUG: auth failed: {err}")
+        return err, code
+
+    print(f"--- DEBUG: authenticated user: {uid}")
     try:
         data = request.json
         device_code = data.get("code").upper().strip()
@@ -637,3 +642,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
