@@ -168,7 +168,7 @@ def authorize_b2(is_public=False):
     return data
 
 def sign_b2(file_path: str, expires: int) -> str:
-    cache_key = f"{file_path}:{expires}"
+    cache_key = f"{B2_PRIVATE_BUCKET_ID}:{file_path}:{expires}"
     if cache_key in signed_url_cache:
         return signed_url_cache[cache_key]
     auth_data = authorize_b2()
@@ -401,7 +401,7 @@ def sign_collection_movie():
 
 @app.delete("/content/movie/<movie_id>")
 def delete_movie(movie_id):
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err: return err, code
     
     doc_ref = db.collection("movies").document(movie_id)
@@ -530,6 +530,7 @@ def mpesa_stk_push():
             "itemId": item_id,
             "itemName": item_name,
             "itemType": item_type,
+            "planType": data.get("planType", "monthly"),
             "amount": amount,
             "status": "PENDING",
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -727,6 +728,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
