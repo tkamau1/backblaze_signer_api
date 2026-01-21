@@ -11,6 +11,7 @@ from cachetools import TTLCache
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
 import base64
+import time
 from requests.auth import HTTPBasicAuth
 
 load_dotenv()
@@ -64,19 +65,19 @@ user_purchase_cache = TTLCache(maxsize=2000, ttl=60)
 
 # --- AUTH & ENTITLEMENT ---
 
-def require_auth() -> Tuple[Optional[str], bool, Optional[Response], Optional[int]]:
-    """Verifies Firebase Token and returns (UID, is_admin)."""
+def require_auth() -> Tuple[Optional[str], bool, Optional[dict], Optional[Response], Optional[int]]:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
-        return None, False, jsonify({"error": "Missing token"}), 401
+        return None, False, None, jsonify({"error": "Missing token"}), 401
     try:
         token = header.split(" ", 1)[1]
         decoded = auth.verify_id_token(token)
         uid = decoded["uid"]
-        is_admin = decoded.get("admin", False) 
-        return uid, is_admin, None, None
+        is_admin = decoded.get("admin", False)
+        return uid, is_admin, decoded, None, None
     except Exception:
-        return None, False, jsonify({"error": "Auth failed"}), 401
+        return None, False, None, jsonify({"error": "Auth failed"}), 401
+
 
 def get_user_purchases(uid: str) -> List[Dict]:
     """Retrieves all completed purchases for a user (1 Firestore Read)."""
@@ -91,32 +92,40 @@ def get_user_purchases(uid: str) -> List[Dict]:
     user_purchase_cache[uid] = purchases
     return purchases
 
-def assert_entitlement(uid: str, is_admin: bool, content_id: str, content_type: str, parent_id: Optional[str] = None):
-    """Refactored: Uses 1 read max by validating in-memory."""
-    if is_admin: return 
+def assert_entitlement(
+    uid: str,
+    is_admin: bool,
+    decoded: dict,
+    content_id: str,
+    content_type: str,
+    parent_id: Optional[str] = None
+):
+    # 0-READ: Admin or Premium
+    if is_admin or time.time() < decoded.get("premiumUntil", 0):
+        return
 
+    # 1-READ: Purchases
     purchases = get_user_purchases(uid)
-    is_entitled = False
 
     if content_type == "season":
-        # Check if they own this season OR the parent series
-        is_entitled = any(
+        allowed = any(
             (p["itemId"] == content_id and p["itemType"] == "season") or
             (parent_id and p["itemId"] == parent_id and p["itemType"] == "series")
             for p in purchases
         )
     elif content_type == "collectionMovie":
-        # Check if they own this movie OR the parent collection
-        is_entitled = any(
+        allowed = any(
             (p["itemId"] == content_id and p["itemType"] == "collectionMovie") or
             (parent_id and p["itemId"] == parent_id and p["itemType"] == "collection")
             for p in purchases
         )
     else:
-        # Standard check (movie, series, collection)
-        is_entitled = any(p["itemId"] == content_id and p["itemType"] == content_type for p in purchases)
+        allowed = any(
+            p["itemId"] == content_id and p["itemType"] == content_type
+            for p in purchases
+        )
 
-    if not is_entitled:
+    if not allowed:
         raise PermissionError(f"Access denied to {content_type} {content_id}")
         
 # --- B2 CORE HELPERS ---
@@ -230,120 +239,160 @@ def get_all_orphans():
 
 @app.post("/sign/movie")
 def sign_movie():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
+    uid, is_admin, decoded, err, code = require_auth()
+    if err:
+        return err, code
+
+    movie_id = request.json["movieId"]
+
     try:
-        movie_id = request.json["movieId"]
-        assert_entitlement(uid, is_admin, movie_id, "movie")
+        assert_entitlement(uid, is_admin, decoded, movie_id, "movie")
+    except PermissionError:
+        # Viral safety fallback
         doc = db.collection("movies").document(movie_id).get()
-        if not doc.exists: return jsonify({"error": "Not found"}), 404
-        movie = doc.to_dict()
-        return jsonify({"url": sign_b2(movie["videoPath"], MOVIE_TTL), "expiresIn": MOVIE_TTL})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        if not doc.exists or not doc.to_dict().get("isFree"):
+            return jsonify({"error": "Access denied"}), 403
+
+    movie = doc.to_dict()
+    return jsonify({
+        "url": sign_b2(movie["videoPath"], MOVIE_TTL),
+        "expiresIn": MOVIE_TTL
+    })
+
 
 @app.post("/sign/series")
 def sign_series():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
+    uid, is_admin, decoded, err, code = require_auth()
+    if err:
+        return err, code
+
+    series_id = request.json["seriesId"]
+    season_id = request.json["seasonId"]
 
     try:
-        series_id = request.json["seriesId"]
-        season_id = request.json["seasonId"]
+        # Premium/Admin OR purchased season/series
+        assert_entitlement(
+            uid,
+            is_admin,
+            decoded,
+            season_id,
+            "season",
+            parent_id=series_id
+        )
+    except PermissionError:
+        # Viral-safe fallback: free season
+        season_ref = (
+            db.collection("series")
+            .document(series_id)
+            .collection("seasons")
+            .document(season_id)
+            .get()
+        )
+        if not season_ref.exists or not season_ref.to_dict().get("isFree"):
+            return jsonify({"error": "Access denied"}), 403
 
-        # entitlement: season OR series
-        assert_entitlement(uid, is_admin, season_id, "season", parent_id=series_id)
-        
-        episodes = db.collection("series") \
-            .document(series_id) \
-            .collection("seasons") \
-            .document(season_id) \
-            .collection("episodes") \
-            .stream()
+    episodes = (
+        db.collection("series")
+        .document(series_id)
+        .collection("seasons")
+        .document(season_id)
+        .collection("episodes")
+        .stream()
+    )
 
-        signed = []
-        for ep in episodes:
-            data = ep.to_dict()
-            signed.append({
-                "episodeId": ep.id,
-                "title": data.get("title"),
-                "url": sign_b2(data["videoPath"], SERIES_TTL),
-                "expiresIn": SERIES_TTL
-            })
-
-        return jsonify({
-            "seriesId": series_id,
-            "seasonId": season_id,
-            "episodes": signed,
+    signed = []
+    for ep in episodes:
+        data = ep.to_dict()
+        signed.append({
+            "episodeId": ep.id,
+            "title": data.get("title"),
+            "url": sign_b2(data["videoPath"], SERIES_TTL),
             "expiresIn": SERIES_TTL
         })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    return jsonify({
+        "seriesId": series_id,
+        "seasonId": season_id,
+        "episodes": signed,
+        "expiresIn": SERIES_TTL
+    })
+
 
 @app.post("/sign/collection")
 def sign_collection():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
+    uid, is_admin, decoded, err, code = require_auth()
+    if err:
+        return err, code
+
+    collection_id = request.json["collectionId"]
 
     try:
-        collection_id = request.json["collectionId"]
-        assert_entitlement(uid, is_admin, collection_id, "collection")
+        assert_entitlement(
+            uid,
+            is_admin,
+            decoded,
+            collection_id,
+            "collection"
+        )
+    except PermissionError:
+        coll_ref = db.collection("collections").document(collection_id).get()
+        if not coll_ref.exists or not coll_ref.to_dict().get("isFree"):
+            return jsonify({"error": "Access denied"}), 403
 
-        coll = db.collection("collections").document(collection_id).get()
-        if not coll.exists:
-            return jsonify({"error": "Not found"}), 404
+    coll = coll_ref.to_dict()
+    signed = []
 
-        movies = coll.to_dict().get("movies", [])
-        signed = []
-
-        for m in movies:
-            signed.append({
-                "movieId": m["movieId"],
-                "url": sign_b2(m["videoPath"], COLLECTION_TTL),
-                "expiresIn": COLLECTION_TTL
-            })
-
-        return jsonify({
-            "collectionId": collection_id,
-            "movies": signed,
+    for m in coll.get("movies", []):
+        signed.append({
+            "movieId": m["movieId"],
+            "url": sign_b2(m["videoPath"], COLLECTION_TTL),
             "expiresIn": COLLECTION_TTL
         })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    return jsonify({
+        "collectionId": collection_id,
+        "movies": signed,
+        "expiresIn": COLLECTION_TTL
+    })
+
         
 @app.post("/sign/collection/movie")
 def sign_collection_movie():
-    uid, is_admin, err, code = require_auth()
-    if err: return err, code
+    uid, is_admin, decoded, err, code = require_auth()
+    if err:
+        return err, code
+
+    movie_id = request.json["movieId"]
+    collection_id = request.json["collectionId"]
 
     try:
-        movie_id = request.json["movieId"]
-        collection_id = request.json["collectionId"]
-        assert_entitlement(uid, is_admin, movie_id, "collectionMovie", parent_id=collection_id)
-        
-        coll = db.collection("collections").document(collection_id).get()
-        if not coll.exists:
-            return jsonify({"error": "Not found"}), 404
+        assert_entitlement(
+            uid,
+            is_admin,
+            decoded,
+            movie_id,
+            "collectionMovie",
+            parent_id=collection_id
+        )
+    except PermissionError:
+        coll_ref = db.collection("collections").document(collection_id).get()
+        if not coll_ref.exists:
+            return jsonify({"error": "Access denied"}), 403
 
         movie = next(
-            (m for m in coll.to_dict().get("movies", []) if m["movieId"] == movie_id),
+            (m for m in coll_ref.to_dict().get("movies", [])
+             if m["movieId"] == movie_id),
             None
         )
 
-        if not movie:
-            return jsonify({"error": "Movie not in collection"}), 404
+        if not movie or not movie.get("isFree"):
+            return jsonify({"error": "Access denied"}), 403
 
-        return jsonify({
-            "movieId": movie_id,
-            "url": sign_b2(movie["videoPath"], MOVIE_TTL),
-            "expiresIn": MOVIE_TTL
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
+    return jsonify({
+        "movieId": movie_id,
+        "url": sign_b2(movie["videoPath"], MOVIE_TTL),
+        "expiresIn": MOVIE_TTL
+    })
 
 @app.delete("/content/movie/<movie_id>")
 def delete_movie(movie_id):
@@ -490,51 +539,78 @@ def mpesa_stk_push():
 def mpesa_callback():
     # LOG: See what Safaricom sends back after payment
     print(f"DEBUG: Mpesa Callback Received: {request.json}")
-    
+
     try:
         data = request.json["Body"]["stkCallback"]
         checkout_id = data["CheckoutRequestID"]
         result_code = data["ResultCode"]
 
         payment_query = db.collection_group("payments").where("checkoutRequestId", "==", checkout_id).limit(1).get()
-        
-        if payment_query:
-            payment_doc = payment_query[0]
-            pay_data = payment_doc.to_dict()
-            uid = payment_doc.reference.parent.parent.id
-            
-            if result_code == 0:
-                # Safaricom sends metadata in a list of Key-Value pairs
-                metadata = data.get("CallbackMetadata", {}).get("Item", [])
-                receipt = next((item["Value"] for item in metadata if item["Name"] == "MpesaReceiptNumber"), "UNKNOWN")
-                
-                payment_doc.reference.update({
-                    "status": "COMPLETED", 
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                    "mpesaReceipt": receipt # Save the actual M-Pesa code
-                })
-                
-                # Also add it to the purchase record
-                db.collection("users").document(uid).collection("purchases").add({
-                    "amount": pay_data.get("amount"),
-                    "currency": "KES",
-                    "itemId": pay_data["itemId"],
-                    "itemType": pay_data["itemType"],
-                    "paymentMethod": "M-PESA",
-                    "purchaseDate": firestore.SERVER_TIMESTAMP,
-                    "purchaseStatus": "complete",
-                    "receiptData": receipt,
-                })
-    
-            else:
-                result_desc = data.get("ResultDesc", "Payment failed")
-                payment_doc.reference.update({
-                    "status": "FAILED",
-                    "errorCode": result_code,
-                    "errorMessage": result_desc,
-                    "updatedAt": firestore.SERVER_TIMESTAMP
-                })
-                print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
+
+        if not payment_query:
+            return jsonify({"ResultCode": 0})
+
+        payment_doc = payment_query[0]
+        pay_data = payment_doc.to_dict()
+        uid = payment_doc.reference.parent.parent.id
+
+        if result_code != 0:
+            result_desc = data.get("ResultDesc", "Payment failed")
+            payment_doc.reference.update({
+                "status": "FAILED",
+                "errorCode": result_code,
+                "errorMessage": result_desc,
+                "updatedAt": firestore.SERVER_TIMESTAMP
+            })
+            print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
+
+        # Safaricom sends metadata in a list of Key-Value pairs
+        metadata = data.get("CallbackMetadata", {}).get("Item", [])
+        receipt = next((item["Value"] for item in metadata if item["Name"] == "MpesaReceiptNumber"), "UNKNOWN")
+
+        payment_doc.reference.update({
+            "status": "COMPLETED",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "mpesaReceipt": receipt # Save the actual M-Pesa code
+        })
+
+        # Also add it to the purchase record
+        db.collection("users").document(uid).collection("purchases").add({
+            "amount": pay_data.get("amount"),
+            "currency": "KES",
+            "itemId": pay_data["itemId"],
+            "itemType": pay_data["itemType"],
+            "paymentMethod": "M-PESA",
+            "purchaseDate": firestore.SERVER_TIMESTAMP,
+            "purchaseStatus": "complete",
+            "receiptData": receipt,
+        })
+
+        # 3. IF SUBSCRIPTION: Update Custom Claims (The Merge Logic)
+        if pay_data["itemType"] == "subscription":
+            # Fetch current user to get existing claims (role, admin)
+            user = auth.get_user(uid)
+            current_claims = user.custom_claims or {}
+            durations = {"weekly": 7, "monthly": 30, "yearly": 365}
+            days = durations.get(pay_data.get("planType"), 30)
+            current_expiry = current_claims.get("premiumUntil", 0)
+            start_ts = max(time.time(), current_expiry)
+
+            new_expiry = datetime.fromtimestamp(start_ts) + timedelta(days=days)
+            new_ts = int(new_expiry.timestamp())
+
+            # Merge: Keep old keys, add/update premiumUntil
+            new_claims = current_claims.copy()
+            new_claims['premiumUntil'] = new_ts
+
+            # Set claims in Firebase Auth
+            auth.set_custom_user_claims(uid, new_claims)
+
+            # Update Firestore User Doc for UI/History
+            db.collection("users").document(uid).update({
+                "premiumUntil": expiry_date,
+                "isPremium": True
+            })
 
         return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
     except Exception as e:
@@ -603,7 +679,7 @@ def verify_tv_code():
             
         # Check if the code is older than 5 minutes
         # Note: server_timestamp returns a datetime object in Python
-        now = datetime.now(created_at.tzinfo)
+        now = datetime.utcnow()
         if now > created_at + timedelta(minutes=DEVICE_CODE_TTL_MINUTES):
             code_ref.delete() # Cleanup expired code
             return jsonify({"error": "Code has expired"}), 403
@@ -642,4 +718,5 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
