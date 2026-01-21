@@ -168,7 +168,9 @@ def authorize_b2(is_public=False):
     return data
 
 def sign_b2(file_path: str, expires: int) -> str:
-    if file_path in signed_url_cache: return signed_url_cache[file_path]
+    cache_key = f"{file_path}:{expires}"
+    if cache_key in signed_url_cache:
+        return signed_url_cache[cache_key]
     auth_data = authorize_b2()
     r = requests.post(
         f"{auth_data['apiUrl']}/b2api/v2/b2_get_download_authorization",
@@ -178,7 +180,7 @@ def sign_b2(file_path: str, expires: int) -> str:
     r.raise_for_status()
     token = r.json()["authorizationToken"]
     url = f"{auth_data['downloadUrl']}/file/{B2_PRIVATE_BUCKET_NAME}/{file_path}?Authorization={token}"
-    signed_url_cache[file_path] = url
+    signed_url_cache[cache_key] = url
     return url
 
 def delete_b2_file(file_path: str, file_id: str) -> bool:
@@ -200,8 +202,9 @@ def delete_b2_file(file_path: str, file_id: str) -> bool:
 
 def get_all_orphans():
     """Scans B2 and Firestore to find unlinked files."""
-    data = request.json or {}         
-    is_public = data.get("isPublic", False)
+    # data = request.json or {}         
+    # is_public = data.get("isPublic", False)
+    is_public = request.args.get("isPublic", "false").lower() == "true"
 
     auth_data = authorize_b2(is_public)
     all_b2_files = {}
@@ -236,6 +239,11 @@ def get_all_orphans():
     return [{"path": p, "id": i} for p, i in all_b2_files.items() if p not in db_paths]
 
 # --- API ROUTES ---
+def is_free(data: dict) -> bool:
+    try:
+        return int(data.get("price", 0)) == 0
+    except (TypeError, ValueError):
+        return False
 
 @app.post("/sign/movie")
 def sign_movie():
@@ -244,16 +252,19 @@ def sign_movie():
         return err, code
 
     movie_id = request.json["movieId"]
+    doc = db.collection("movies").document(movie_id).get()
 
+    if not doc.exists:
+        return jsonify({"error": "Not found"}), 404
+    
     try:
         assert_entitlement(uid, is_admin, decoded, movie_id, "movie")
     except PermissionError:
-        # Viral safety fallback
-        doc = db.collection("movies").document(movie_id).get()
-        if not doc.exists or not doc.to_dict().get("isFree"):
+        if not is_free(doc.to_dict()):
             return jsonify({"error": "Access denied"}), 403
-
+    
     movie = doc.to_dict()
+    
     return jsonify({
         "url": sign_b2(movie["videoPath"], MOVIE_TTL),
         "expiresIn": MOVIE_TTL
@@ -269,6 +280,17 @@ def sign_series():
     series_id = request.json["seriesId"]
     season_id = request.json["seasonId"]
 
+    season_ref = (
+        db.collection("series")
+        .document(series_id)
+        .collection("seasons")
+        .document(season_id)
+        .get()
+    )
+
+    if not season_ref.exists:
+        return jsonify({"error": "Not found"}), 404
+    
     try:
         # Premium/Admin OR purchased season/series
         assert_entitlement(
@@ -280,15 +302,7 @@ def sign_series():
             parent_id=series_id
         )
     except PermissionError:
-        # Viral-safe fallback: free season
-        season_ref = (
-            db.collection("series")
-            .document(series_id)
-            .collection("seasons")
-            .document(season_id)
-            .get()
-        )
-        if not season_ref.exists or not season_ref.to_dict().get("isFree"):
+        if not is_free(season_ref.to_dict()):
             return jsonify({"error": "Access denied"}), 403
 
     episodes = (
@@ -325,18 +339,14 @@ def sign_collection():
         return err, code
 
     collection_id = request.json["collectionId"]
-
+    coll_ref = db.collection("collections").document(collection_id).get()
+    if not coll_ref.exists:
+        return jsonify({"error": "Not found"}), 404
+        
     try:
-        assert_entitlement(
-            uid,
-            is_admin,
-            decoded,
-            collection_id,
-            "collection"
-        )
+        assert_entitlement(uid,is_admin,decoded,collection_id,"collection")
     except PermissionError:
-        coll_ref = db.collection("collections").document(collection_id).get()
-        if not coll_ref.exists or not coll_ref.to_dict().get("isFree"):
+        if not is_free(coll_ref.to_dict()):
             return jsonify({"error": "Access denied"}), 403
 
     coll = coll_ref.to_dict()
@@ -364,28 +374,23 @@ def sign_collection_movie():
 
     movie_id = request.json["movieId"]
     collection_id = request.json["collectionId"]
+    coll_ref = db.collection("collections").document(collection_id).get()
+    if not coll_ref.exists:
+        return jsonify({"error": "Not found"}), 404
 
+    movie = next(
+        (m for m in coll_ref.to_dict().get("movies", [])
+         if m["movieId"] == movie_id),
+        None
+    )
+    
+    if not movie:
+        return jsonify({"error": "Not found"}), 404
+        
     try:
-        assert_entitlement(
-            uid,
-            is_admin,
-            decoded,
-            movie_id,
-            "collectionMovie",
-            parent_id=collection_id
-        )
+        assert_entitlement(uid,is_admin,decoded,movie_id,"collectionMovie",parent_id=collection_id)
     except PermissionError:
-        coll_ref = db.collection("collections").document(collection_id).get()
-        if not coll_ref.exists:
-            return jsonify({"error": "Access denied"}), 403
-
-        movie = next(
-            (m for m in coll_ref.to_dict().get("movies", [])
-             if m["movieId"] == movie_id),
-            None
-        )
-
-        if not movie or not movie.get("isFree"):
+        if not is_free(movie):
             return jsonify({"error": "Access denied"}), 403
 
     return jsonify({
@@ -414,14 +419,14 @@ def delete_movie(movie_id):
 
 @app.get("/admin/cleanup/orphans")
 def list_orphans():
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err or not is_admin: return jsonify({"error": "Admin only"}), 403
     orphans = get_all_orphans()
     return jsonify({"count": len(orphans), "orphans": orphans})
 
 @app.post("/admin/cleanup/purge-orphans")
 def purge_orphans():
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err or not is_admin: return jsonify({"error": "Admin only"}), 403
 
     dry_run = request.args.get("dry_run", "true").lower() == "true"
@@ -437,7 +442,7 @@ def purge_orphans():
 
 @app.post("/v1/auth/b2-token")
 def get_b2_upload_token():
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err: return err, code
     
     try:
@@ -467,7 +472,7 @@ def get_b2_upload_token():
 
 @app.post("/v1/payments/stk-push")
 def mpesa_stk_push():
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err: return err, code
 
     data = request.json
@@ -524,7 +529,7 @@ def mpesa_stk_push():
         db.collection("users").document(uid).collection("payments").document(checkout_id).set({
             "itemId": item_id,
             "itemName": item_name,
-            "item_type": item_type,
+            "itemType": item_type,
             "amount": amount,
             "status": "PENDING",
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -553,6 +558,9 @@ def mpesa_callback():
         payment_doc = payment_query[0]
         pay_data = payment_doc.to_dict()
         uid = payment_doc.reference.parent.parent.id
+        
+        if pay_data.get("status") == "COMPLETED":
+            return jsonify({"ResultCode": 0})
 
         if result_code != 0:
             result_desc = data.get("ResultDesc", "Payment failed")
@@ -563,6 +571,7 @@ def mpesa_callback():
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
             print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
+            return jsonify({"ResultCode": result_code, "ResultDesc": result_desc})
 
         # Safaricom sends metadata in a list of Key-Value pairs
         metadata = data.get("CallbackMetadata", {}).get("Item", [])
@@ -608,7 +617,7 @@ def mpesa_callback():
 
             # Update Firestore User Doc for UI/History
             db.collection("users").document(uid).update({
-                "premiumUntil": expiry_date,
+                "premiumUntil": new_ts,
                 "isPremium": True
             })
 
@@ -620,7 +629,7 @@ def mpesa_callback():
 @app.get("/v1/debug/config-check")
 def config_check():
     """Checks if Environment Variables are loaded without showing full secrets."""
-    uid, is_admin, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_auth()
     if err or not is_admin: 
         return jsonify({"error": "Admin only"}), 403
 
@@ -718,5 +727,6 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
