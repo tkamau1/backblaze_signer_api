@@ -92,41 +92,53 @@ def get_user_purchases(uid: str) -> List[Dict]:
     user_purchase_cache[uid] = purchases
     return purchases
 
-def assert_entitlement(
-    uid: str,
-    is_admin: bool,
-    decoded: dict,
-    content_id: str,
-    content_type: str,
-    parent_id: Optional[str] = None
-):
-    # 0-READ: Admin or Premium
+def assert_entitlement(uid: str,is_admin: bool,decoded: dict,content_id: str,content_type: str,parent_id: str = None,part_id: str = None):
+    """
+    Check if user has access to the content.
+    - Admin / Premium users bypass checks
+    - Supports per-part purchase for series
+    """
     if is_admin or time.time() < decoded.get("premiumUntil", 0):
         return
 
-    # 1-READ: Purchases
     purchases = get_user_purchases(uid)
+    allowed = False
 
-    if content_type == "season":
+    if content_type == "seriesPart" and parent_id and part_id:
+        # Check if user bought the part or the whole series
         allowed = any(
-            (p["itemId"] == content_id and p["itemType"] == "season") or
-            (parent_id and p["itemId"] == parent_id and p["itemType"] == "series")
+            (p["itemId"] == part_id and p["itemType"] == "seriesPart") or
+            (p["itemId"] == parent_id and p["itemType"] == "series")
             for p in purchases
         )
-    elif content_type == "collectionMovie":
+    elif content_type == "series":
+        # Either purchased the series itself
+        allowed = any(
+            (p["itemId"] == content_id and p["itemType"] == "series")
+            for p in purchases
+        )
+    elif content_type == "movie":
+        allowed = any(
+            p["itemId"] == content_id and p["itemType"] == "movie"
+            for p in purchases
+        )
+    elif content_type == "collectionMovie" and parent_id:
         allowed = any(
             (p["itemId"] == content_id and p["itemType"] == "collectionMovie") or
-            (parent_id and p["itemId"] == parent_id and p["itemType"] == "collection")
+            (p["itemId"] == parent_id and p["itemType"] == "collection")
             for p in purchases
         )
-    else:
+    elif content_type == "collection":
         allowed = any(
-            p["itemId"] == content_id and p["itemType"] == content_type
+            p["itemId"] == content_id and p["itemType"] == "collection"
             for p in purchases
         )
 
     if not allowed:
-        raise PermissionError(f"Access denied to {content_type} {content_id}")
+        raise PermissionError(
+            f"Access denied to {content_type} {content_id}"
+            + (f" (parent {parent_id})" if parent_id else "")
+        )
         
 # --- B2 CORE HELPERS ---
 b2_auth_store = {
@@ -199,19 +211,15 @@ def delete_b2_file(file_path: str, file_id: str) -> bool:
         return False
 
 # --- ORPHAN LOGIC ---
-
 def get_all_orphans():
-    """Scans B2 and Firestore to find unlinked files."""
-    # data = request.json or {}         
-    # is_public = data.get("isPublic", False)
+    """Return B2 files that are not referenced anywhere in Firestore."""
     is_public = request.args.get("isPublic", "false").lower() == "true"
-
     auth_data = authorize_b2(is_public)
+    target_bucket = B2_PUBLIC_BUCKET_ID if is_public else B2_PRIVATE_BUCKET_ID
+
     all_b2_files = {}
     next_file_name = None
 
-    target_bucket = B2_PUBLIC_BUCKET_ID if is_public else B2_PRIVATE_BUCKET_ID
-    
     # Step 1: Paginated B2 Scan
     while True:
         r = requests.post(
@@ -226,17 +234,26 @@ def get_all_orphans():
         next_file_name = data.get("nextFileName")
         if not next_file_name: break
 
-    # Step 2: Firestore Path Collection
+    # Step 2: Collect all Firestore video paths
     db_paths = set()
+    
+    # Movies
     for m in db.collection("movies").stream():
         db_paths.add(m.to_dict().get("videoPath"))
-    for ep in db.collection_group("episodes").stream():
-        db_paths.add(ep.to_dict().get("videoPath"))
+
+    # Series parts
+    for s in db.collection("series").stream():
+        for part in s.to_dict().get("parts", []):
+            db_paths.add(part.get("videoPath"))
+
+    # Collection movies
     for coll in db.collection("collections").stream():
         for item in coll.to_dict().get("movies", []):
             db_paths.add(item.get("videoPath"))
 
-    return [{"path": p, "id": i} for p, i in all_b2_files.items() if p not in db_paths]
+    # Return orphan files
+    orphans = [{"path": p, "id": i} for p, i in all_b2_files.items() if p not in db_paths]
+    return orphans
 
 # --- API ROUTES ---
 def is_free(data: dict) -> bool:
@@ -269,69 +286,81 @@ def sign_movie():
         "url": sign_b2(movie["videoPath"], MOVIE_TTL),
         "expiresIn": MOVIE_TTL
     })
-
-
 @app.post("/sign/series")
 def sign_series():
+    """Signs all parts in a series (for bulk loading/pre-caching)."""
     uid, is_admin, decoded, err, code = require_auth()
-    if err:
-        return err, code
+    if err: return err, code
 
-    series_id = request.json["seriesId"]
-    season_id = request.json["seasonId"]
+    series_id = request.json.get("seriesId")
+    doc = db.collection("series").document(series_id).get()
 
-    season_ref = (
-        db.collection("series")
-        .document(series_id)
-        .collection("seasons")
-        .document(season_id)
-        .get()
-    )
-
-    if not season_ref.exists:
-        return jsonify({"error": "Not found"}), 404
+    if not doc.exists:
+        return jsonify({"error": "Series not found"}), 404
+    
+    series_data = doc.to_dict()
     
     try:
-        # Premium/Admin OR purchased season/series
-        assert_entitlement(
-            uid,
-            is_admin,
-            decoded,
-            season_id,
-            "season",
-            parent_id=series_id
-        )
+        assert_entitlement(uid, is_admin, decoded, series_id, "series")
     except PermissionError:
-        if not is_free(season_ref.to_dict()):
+        if not is_free(series_data):
             return jsonify({"error": "Access denied"}), 403
 
-    episodes = (
-        db.collection("series")
-        .document(series_id)
-        .collection("seasons")
-        .document(season_id)
-        .collection("episodes")
-        .stream()
-    )
+    parts = series_data.get("parts", [])
+    signed_parts = []
 
-    signed = []
-    for ep in episodes:
-        data = ep.to_dict()
-        signed.append({
-            "episodeId": ep.id,
-            "title": data.get("title"),
-            "url": sign_b2(data["videoPath"], SERIES_TTL),
+    for p in parts:
+        # Using 'videoPath' and 'partName' from your doc example
+        signed_parts.append({
+            "partId": p.get("partId"),
+            "partName": p.get("partName"),
+            "url": sign_b2(p["videoPath"], SERIES_TTL),
             "expiresIn": SERIES_TTL
         })
 
     return jsonify({
         "seriesId": series_id,
-        "seasonId": season_id,
-        "episodes": signed,
+        "parts": signed_parts,
         "expiresIn": SERIES_TTL
     })
 
 
+@app.post("/sign/series/part")
+def sign_series_part():
+    """Signs a single specific part by searching the parts array."""
+    uid, is_admin, decoded, err, code = require_auth()
+    if err: return err, code
+
+    data = request.json
+    series_id = data.get("seriesId")
+    part_id = data.get("partId")
+
+    doc = db.collection("series").document(series_id).get()
+    if not doc.exists:
+        return jsonify({"error": "Series not found"}), 404
+
+    series_data = doc.to_dict()
+    parts = series_data.get("parts", [])
+    
+    # Find the specific part in the array
+    part = next((p for p in parts if p.get("partId") == part_id), None)
+    if not part:
+        return jsonify({"error": "Part not found"}), 404
+
+    try:
+        assert_entitlement(uid, is_admin, decoded, series_id, "series")
+    except PermissionError:
+        # If series is not free, check if this specific part is free (teaser)
+        if not is_free(series_data) and not is_free(part):
+            return jsonify({"error": "Access denied"}), 403
+
+    return jsonify({
+        "seriesId": series_id,
+        "partId": part_id,
+        "url": sign_b2(part["videoPath"], SERIES_TTL),
+        "expiresIn": SERIES_TTL
+    })
+    
 @app.post("/sign/collection")
 def sign_collection():
     uid, is_admin, decoded, err, code = require_auth()
@@ -728,7 +757,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
