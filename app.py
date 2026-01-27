@@ -514,8 +514,8 @@ def mpesa_stk_push():
     data = request.json
     print(f"DEBUG: Incoming Flutter Data: {data}")
     
-    phone = data["phone"]  # Should be in format 254XXXXXXXXX
-    amount = int(data["amount"])
+    phone = data["phone"]
+    amount = int(data["amount"])  # Lipana expects integer
     item_id = data["item_id"]
     item_name = data["item_name"]
     item_type = data["item_type"]
@@ -524,20 +524,21 @@ def mpesa_stk_push():
     if not phone.startswith("254") or len(phone) != 12:
         return jsonify({"error": "Phone must be in format 254XXXXXXXXX"}), 400
 
-    # Prepare Lipana request
+    # Prepare Lipana STK Push request
     lipana_payload = {
         "amount": amount,
         "phone_number": phone,
         "account_reference": item_id[:12],  # Max 12 chars
-        "transaction_desc": f"Payment for {item_name}"[:20],  # Max 20 chars
-        "callback_url": LIPANA_CALLBACK_URL,
-        "till_number": LIPANA_TILL_NUMBER  # Use your till
+        "transaction_desc": item_name[:20] if item_name else "Payment"  # Max 20 chars
     }
 
     headers = {
-        "Authorization": f"Bearer {LIPANA_API_KEY}",
+        "Authorization": f"Bearer {LIPANA_SECRET_KEY}",
         "Content-Type": "application/json"
     }
+
+    print(f"DEBUG: Lipana URL: {LIPANA_BASE_URL}/stk-push")
+    print(f"DEBUG: Lipana Payload: {lipana_payload}")
 
     try:
         # Call Lipana STK Push endpoint
@@ -549,11 +550,17 @@ def mpesa_stk_push():
         )
         
         print(f"DEBUG: Lipana Response Status: {response.status_code}")
-        print(f"DEBUG: Lipana Response Body: {response.json()}")
+        print(f"DEBUG: Lipana Response Body: {response.text}")
 
         if response.status_code in [200, 201]:
             lipana_data = response.json()
-            checkout_id = lipana_data.get("checkout_request_id") or lipana_data.get("CheckoutRequestID")
+            
+            # Lipana response structure
+            checkout_id = lipana_data.get("checkout_request_id")
+            
+            if not checkout_id:
+                print(f"ERROR: No checkout_request_id in response: {lipana_data}")
+                return jsonify({"error": "Invalid response from payment provider"}), 500
             
             # Save to Firestore
             db.collection("users").document(uid).collection("payments").document(checkout_id).set({
@@ -569,22 +576,28 @@ def mpesa_stk_push():
                 "phoneNumber": phone
             })
             
+            # Return in Safaricom format (for Flutter compatibility)
             return jsonify({
                 "CheckoutRequestID": checkout_id,
-                "CustomerMessage": lipana_data.get("customer_message", "STK Push sent"),
+                "CustomerMessage": lipana_data.get("message", "STK Push sent to your phone"),
                 "ResponseCode": "0",
                 "ResponseDescription": "Success"
             })
         else:
-            error_data = response.json()
+            error_data = response.json() if response.headers.get('content-type') == 'application/json' else {"error": response.text}
+            print(f"ERROR: Lipana returned {response.status_code}: {error_data}")
             return jsonify({
-                "error": "Lipana request failed", 
+                "error": "Payment request failed", 
                 "details": error_data
-            }), 400
+            }), response.status_code
             
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Network error calling Lipana: {str(e)}")
+        return jsonify({"error": f"Payment service unavailable: {str(e)}"}), 500
     except Exception as e:
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
+
 
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
@@ -594,12 +607,16 @@ def lipana_callback():
     try:
         data = request.json
         
-        # Lipana sends a cleaner payload than raw Safaricom
+        # Lipana callback structure
         checkout_id = data.get("checkout_request_id")
-        status = data.get("status")  # "SUCCESS", "FAILED", "CANCELLED"
-        mpesa_receipt = data.get("mpesa_receipt_number")
-        result_code = data.get("result_code", 0)
-        result_desc = data.get("result_description", "")
+        status = data.get("status")  # "success", "failed", "cancelled"
+        mpesa_receipt = data.get("receipt_number") or data.get("mpesa_receipt_number")
+        amount = data.get("amount")
+        phone = data.get("phone_number")
+
+        if not checkout_id:
+            print("ERROR: No checkout_request_id in callback")
+            return jsonify({"message": "Invalid callback data"}), 400
 
         # Find the payment document
         payment_query = db.collection_group("payments")\
@@ -608,7 +625,7 @@ def lipana_callback():
 
         if not payment_query:
             print(f"WARNING: Payment not found for checkout {checkout_id}")
-            return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"}), 200
+            return jsonify({"message": "Payment not found"}), 404
 
         payment_doc = payment_query[0]
         pay_data = payment_doc.to_dict()
@@ -616,15 +633,16 @@ def lipana_callback():
         
         # Prevent duplicate processing
         if pay_data.get("status") in ["COMPLETED", "FAILED"]:
-            return jsonify({"ResultCode": 0, "ResultDesc": "Already processed"}), 200
+            print(f"INFO: Payment {checkout_id} already processed as {pay_data.get('status')}")
+            return jsonify({"message": "Already processed"}), 200
 
         # Handle SUCCESS
-        if status == "SUCCESS" and result_code == 0:
+        if status and status.lower() == "success":
             payment_doc.reference.update({
                 "status": "COMPLETED",
                 "updatedAt": firestore.SERVER_TIMESTAMP,
                 "mpesaReceipt": mpesa_receipt,
-                "resultDescription": result_desc
+                "resultDescription": "Payment successful"
             })
 
             # Add to purchases
@@ -636,11 +654,11 @@ def lipana_callback():
                 "paymentMethod": "M-PESA",
                 "purchaseDate": firestore.SERVER_TIMESTAMP,
                 "purchaseStatus": "complete",
-                "receiptData": mpesa_receipt,
+                "receiptData": mpesa_receipt or "LIPANA_" + checkout_id,
             })
 
             # Handle subscription if applicable
-            if pay_data["itemType"] == "subscription":
+            if pay_data.get("itemType") == "subscription":
                 user = auth.get_user(uid)
                 current_claims = user.custom_claims or {}
                 durations = {"weekly": 7, "monthly": 30, "yearly": 365}
@@ -664,20 +682,22 @@ def lipana_callback():
             
         # Handle FAILED/CANCELLED
         else:
+            failure_reason = data.get("message") or data.get("result_description") or "Payment failed"
             payment_doc.reference.update({
                 "status": "FAILED",
-                "errorCode": result_code,
-                "errorMessage": result_desc,
+                "errorMessage": failure_reason,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
-            print(f"FAILED: Payment {checkout_id} - {result_desc}")
+            print(f"FAILED: Payment {checkout_id} - {failure_reason}")
 
-        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"}), 200
+        return jsonify({"message": "Callback processed"}), 200
 
     except Exception as e:
         print(f"ERROR: Callback processing failed: {str(e)}")
-        return jsonify({"ResultCode": 1, "ResultDesc": "Internal Error"}), 500
-
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal error"}), 500
+        
 @app.get("/v1/debug/config-check")
 def config_check():
     """Checks if Environment Variables are loaded without showing full secrets."""
@@ -779,4 +799,5 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
