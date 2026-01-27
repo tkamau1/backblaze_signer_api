@@ -40,10 +40,16 @@ MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
 MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for sandbox, while CustomerBuyGoodsOnline for Live
 
 # Add Lipana configuration
-LIPANA_API_KEY = os.getenv("LIPANA_API_KEY")
-LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
 LIPANA_TILL_NUMBER = os.getenv("LIPANA_TILL_NUMBER")
-LIPANA_BASE_URL = "https://api.lipana.dev/v1" if LIPANA_ENVIRONMENT == "production" else "https://sandbox.lipana.dev/v1"
+LIPANA_SECRET_KEY = os.getenv("LIPANA_SECRET_KEY")  # lip_sk_test_...
+LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
+
+# CORRECT URLs
+if LIPANA_ENVIRONMENT == "production":
+    LIPANA_BASE_URL = "https://api.lipana.dev/v1"
+else:
+    LIPANA_BASE_URL = "https://api.lipana.dev/sandbox"
+
 LIPANA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/lipana-callback"
 
 # Signed URL TTLs
@@ -713,6 +719,11 @@ def config_check():
         "MPESA_TILL_NUMBER": os.getenv("MPESA_TILL_NUMBER"),
         "FIREBASE_SECRET_FILE_EXISTS": os.path.exists("/etc/secrets/serviceAccountKey.json"),
         "ENV_MODE": "Production" if os.getenv("RENDER") else "Local"
+        "LIPANA_SECRET_KEY_LOADED": bool(LIPANA_SECRET_KEY),
+        "LIPANA_SECRET_KEY_PREFIX": LIPANA_SECRET_KEY[:15] if LIPANA_SECRET_KEY else None,
+        "LIPANA_ENVIRONMENT": LIPANA_ENVIRONMENT,
+        "LIPANA_BASE_URL": LIPANA_BASE_URL,
+        "LIPANA_CALLBACK_URL": LIPANA_CALLBACK_URL
     }
     
     # Log it to Render console too
@@ -799,5 +810,6 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
