@@ -3,7 +3,8 @@ import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple, Optional
-
+import hmac
+import hashlib
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -43,6 +44,7 @@ MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for san
 LIPANA_TILL_NUMBER = os.getenv("LIPANA_TILL_NUMBER")
 LIPANA_SECRET_KEY = os.getenv("LIPANA_SECRET_KEY")   # lip_sk_test_...
 LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
+LIPANA_WEBHOOK_SECRET =  os.getenv("LIPANA_WEBHOOK_SECRET")
 LIPANA_BASE_URL = "https://api.lipana.dev/v1" 
 LIPANA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/lipana-callback"
 
@@ -599,20 +601,39 @@ def mpesa_stk_push():
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
 
-
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
     """Handles payment status updates from Lipana"""
+    
+    # STEP 1: Verify webhook signature (IMPORTANT FOR SECURITY)
+    signature = request.headers.get('X-Lipana-Signature') or request.headers.get('x-lipana-signature')
+    
+    if signature and LIPANA_WEBHOOK_SECRET:
+        # Get raw request body
+        payload = request.get_data()
+        
+        # Compute expected signature
+        expected_signature = hmac.new(
+            LIPANA_WEBHOOK_SECRET.encode(),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Verify signature
+        if not hmac.compare_digest(signature, expected_signature):
+            print("ERROR: Invalid webhook signature")
+            return jsonify({"error": "Unauthorized"}), 401
+    
     print(f"DEBUG: Lipana Callback Received: {request.json}")
 
     try:
         data = request.json
         
-        # Lipana callback structure - they use "event" and nested data
+        # Lipana callback structure
         event = data.get("event")
         event_data = data.get("data", {})
         
-        # Get transaction ID (this is what we stored in Firestore)
+        # Get transaction ID
         transaction_id = event_data.get("transactionId") or event_data.get("transaction_id")
         status = event_data.get("status")
         mpesa_receipt = event_data.get("mpesaReceiptNumber") or event_data.get("receipt_number")
@@ -623,9 +644,9 @@ def lipana_callback():
             print("ERROR: No transactionId in callback")
             return jsonify({"message": "Invalid callback data"}), 400
 
-        print(f"DEBUG: Processing callback for transaction: {transaction_id}, event: {event}, status: {status}")
+        print(f"DEBUG: Processing callback - TxnID: {transaction_id}, Event: {event}, Status: {status}")
 
-        # Find the payment document using transactionId
+        # Find the payment document
         payment_query = db.collection_group("payments")\
             .where("transactionId", "==", transaction_id)\
             .limit(1).get()
@@ -640,10 +661,10 @@ def lipana_callback():
         
         # Prevent duplicate processing
         if pay_data.get("status") in ["COMPLETED", "FAILED"]:
-            print(f"INFO: Payment {transaction_id} already processed as {pay_data.get('status')}")
+            print(f"INFO: Payment {transaction_id} already processed")
             return jsonify({"message": "Already processed"}), 200
 
-        # Handle SUCCESS - Lipana uses event names like "transaction.success"
+        # Handle SUCCESS
         if event in ["transaction.success", "payment.success"] or (status and status.lower() == "success"):
             payment_doc.reference.update({
                 "status": "COMPLETED",
@@ -697,7 +718,7 @@ def lipana_callback():
             })
             print(f"FAILED: Payment {transaction_id} - {failure_reason}")
         else:
-            print(f"WARNING: Unknown event type: {event} with status: {status}")
+            print(f"WARNING: Unknown event: {event} with status: {status}")
 
         return jsonify({"message": "Callback processed"}), 200
 
@@ -706,6 +727,40 @@ def lipana_callback():
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal error"}), 500
+
+@app.post("/v1/payments/test-complete/<transaction_id>")
+def test_complete_payment(transaction_id):
+    """Manual endpoint to complete a payment (for testing only)"""
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+    
+    # Simulate Lipana success callback
+    callback_data = {
+        "event": "transaction.success",
+        "data": {
+            "transactionId": transaction_id,
+            "status": "success",
+            "amount": 10,
+            "phone": "254711847919",
+            "mpesaReceiptNumber": f"TEST{transaction_id[-8:]}"
+        }
+    }
+    
+    # Call your own callback
+    try:
+        with app.test_request_context(
+            '/v1/payments/lipana-callback',
+            method='POST',
+            json=callback_data
+        ):
+            response = lipana_callback()
+            return jsonify({
+                "message": "Test callback processed",
+                "result": response
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
         
 @app.get("/v1/debug/config-check")
 def config_check():
@@ -726,7 +781,8 @@ def config_check():
         "LIPANA_SECRET_KEY_PREFIX": LIPANA_SECRET_KEY[:15] if LIPANA_SECRET_KEY else None,
         "LIPANA_ENVIRONMENT": LIPANA_ENVIRONMENT,
         "LIPANA_BASE_URL": LIPANA_BASE_URL,
-        "LIPANA_CALLBACK_URL": LIPANA_CALLBACK_URL
+        "LIPANA_CALLBACK_URL": LIPANA_CALLBACK_URL,
+        "LIPANA_WEBHOOK_SECRET": LIPANA_WEBHOOK_SECRET,
     }
     
     # Log it to Render console too
@@ -813,6 +869,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
