@@ -718,7 +718,7 @@ def config_check():
         "MPESA_STORE_NUMBER": os.getenv("MPESA_STORE_NUMBER"),
         "MPESA_TILL_NUMBER": os.getenv("MPESA_TILL_NUMBER"),
         "FIREBASE_SECRET_FILE_EXISTS": os.path.exists("/etc/secrets/serviceAccountKey.json"),
-        "ENV_MODE": "Production" if os.getenv("RENDER") else "Local"
+        "ENV_MODE": "Production" if os.getenv("RENDER") else "Local",
         "LIPANA_SECRET_KEY_LOADED": bool(LIPANA_SECRET_KEY),
         "LIPANA_SECRET_KEY_PREFIX": LIPANA_SECRET_KEY[:15] if LIPANA_SECRET_KEY else None,
         "LIPANA_ENVIRONMENT": LIPANA_ENVIRONMENT,
@@ -810,6 +810,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
