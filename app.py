@@ -515,7 +515,7 @@ def mpesa_stk_push():
     print(f"DEBUG: Incoming Flutter Data: {data}")
     
     phone = data["phone"]
-    amount = int(data["amount"])  # Lipana expects integer
+    amount = int(data["amount"])
     item_id = data["item_id"]
     item_name = data["item_name"]
     item_type = data["item_type"]
@@ -526,22 +526,20 @@ def mpesa_stk_push():
 
     # Prepare Lipana STK Push request
     lipana_payload = {
-        "phone": phone,  # Changed from "phone_number" to "phone"
+        "phone": phone,
         "amount": amount
     }
 
     headers = {
-        "x-api-key": LIPANA_SECRET_KEY,  # Changed from "Authorization: Bearer" to "x-api-key"
+        "x-api-key": LIPANA_SECRET_KEY,
         "Content-Type": "application/json"
     }
 
-    # CORRECT endpoint: /transactions/push-stk
     lipana_url = f"{LIPANA_BASE_URL}/transactions/push-stk"
     print(f"DEBUG: Lipana URL: {lipana_url}")
     print(f"DEBUG: Lipana Payload: {lipana_payload}")
 
     try:
-        # Call Lipana STK Push endpoint
         response = requests.post(
             lipana_url,
             json=lipana_payload,
@@ -554,17 +552,18 @@ def mpesa_stk_push():
 
         if response.status_code in [200, 201]:
             lipana_data = response.json()
+            response_data = lipana_data.get("data", {})
             
-            # Lipana response structure
-            checkout_id = lipana_data.get("data", {}).get("checkoutRequestID")
-            transaction_id = lipana_data.get("data", {}).get("transactionId")
+            # Lipana uses transactionId, not checkoutRequestID
+            transaction_id = response_data.get("transactionId")
+            checkout_id = response_data.get("checkoutRequestID") or transaction_id  # Fallback to transactionId
             
-            if not checkout_id:
-                print(f"ERROR: No checkoutRequestID in response: {lipana_data}")
+            if not transaction_id:
+                print(f"ERROR: No transactionId in response: {lipana_data}")
                 return jsonify({"error": "Invalid response from payment provider"}), 500
             
-            # Save to Firestore using checkoutRequestID as document ID
-            db.collection("users").document(uid).collection("payments").document(checkout_id).set({
+            # Use transaction_id as the document ID (since that's what Lipana uses)
+            db.collection("users").document(uid).collection("payments").document(transaction_id).set({
                 "itemId": item_id,
                 "itemName": item_name,
                 "itemType": item_type,
@@ -572,16 +571,16 @@ def mpesa_stk_push():
                 "amount": amount,
                 "status": "PENDING",
                 "createdAt": firestore.SERVER_TIMESTAMP,
-                "checkoutRequestId": checkout_id,
-                "transactionId": transaction_id,
+                "checkoutRequestId": checkout_id,  # For Flutter compatibility
+                "transactionId": transaction_id,    # Lipana's actual ID
                 "paymentProvider": "lipana",
                 "phoneNumber": phone
             })
             
-            # Return in Safaricom format (for Flutter compatibility)
+            # Return in format Flutter expects (using transactionId as CheckoutRequestID)
             return jsonify({
-                "CheckoutRequestID": checkout_id,
-                "CustomerMessage": lipana_data.get("data", {}).get("message", "STK Push sent to your phone"),
+                "CheckoutRequestID": transaction_id,  # Use transactionId here
+                "CustomerMessage": response_data.get("message", "STK Push sent to your phone"),
                 "ResponseCode": "0",
                 "ResponseDescription": "Success"
             })
@@ -599,7 +598,8 @@ def mpesa_stk_push():
     except Exception as e:
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
-        
+
+
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
     """Handles payment status updates from Lipana"""
@@ -608,24 +608,30 @@ def lipana_callback():
     try:
         data = request.json
         
-        # Lipana callback structure
-        checkout_id = data.get("checkout_request_id")
-        status = data.get("status")  # "success", "failed", "cancelled"
-        mpesa_receipt = data.get("receipt_number") or data.get("mpesa_receipt_number")
-        amount = data.get("amount")
-        phone = data.get("phone_number")
+        # Lipana callback structure - they use "event" and nested data
+        event = data.get("event")
+        event_data = data.get("data", {})
+        
+        # Get transaction ID (this is what we stored in Firestore)
+        transaction_id = event_data.get("transactionId") or event_data.get("transaction_id")
+        status = event_data.get("status")
+        mpesa_receipt = event_data.get("mpesaReceiptNumber") or event_data.get("receipt_number")
+        amount = event_data.get("amount")
+        phone = event_data.get("phone") or event_data.get("phone_number")
 
-        if not checkout_id:
-            print("ERROR: No checkout_request_id in callback")
+        if not transaction_id:
+            print("ERROR: No transactionId in callback")
             return jsonify({"message": "Invalid callback data"}), 400
 
-        # Find the payment document
+        print(f"DEBUG: Processing callback for transaction: {transaction_id}, event: {event}, status: {status}")
+
+        # Find the payment document using transactionId
         payment_query = db.collection_group("payments")\
-            .where("checkoutRequestId", "==", checkout_id)\
+            .where("transactionId", "==", transaction_id)\
             .limit(1).get()
 
         if not payment_query:
-            print(f"WARNING: Payment not found for checkout {checkout_id}")
+            print(f"WARNING: Payment not found for transaction {transaction_id}")
             return jsonify({"message": "Payment not found"}), 404
 
         payment_doc = payment_query[0]
@@ -634,11 +640,11 @@ def lipana_callback():
         
         # Prevent duplicate processing
         if pay_data.get("status") in ["COMPLETED", "FAILED"]:
-            print(f"INFO: Payment {checkout_id} already processed as {pay_data.get('status')}")
+            print(f"INFO: Payment {transaction_id} already processed as {pay_data.get('status')}")
             return jsonify({"message": "Already processed"}), 200
 
-        # Handle SUCCESS
-        if status and status.lower() == "success":
+        # Handle SUCCESS - Lipana uses event names like "transaction.success"
+        if event in ["transaction.success", "payment.success"] or (status and status.lower() == "success"):
             payment_doc.reference.update({
                 "status": "COMPLETED",
                 "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -655,7 +661,7 @@ def lipana_callback():
                 "paymentMethod": "M-PESA",
                 "purchaseDate": firestore.SERVER_TIMESTAMP,
                 "purchaseStatus": "complete",
-                "receiptData": mpesa_receipt or "LIPANA_" + checkout_id,
+                "receiptData": mpesa_receipt or "LIPANA_" + transaction_id,
             })
 
             # Handle subscription if applicable
@@ -679,17 +685,19 @@ def lipana_callback():
                     "isPremium": True
                 })
 
-            print(f"SUCCESS: Payment {checkout_id} completed with receipt {mpesa_receipt}")
+            print(f"SUCCESS: Payment {transaction_id} completed with receipt {mpesa_receipt}")
             
         # Handle FAILED/CANCELLED
-        else:
-            failure_reason = data.get("message") or data.get("result_description") or "Payment failed"
+        elif event in ["transaction.failed", "transaction.cancelled", "payment.failed"] or (status and status.lower() in ["failed", "cancelled"]):
+            failure_reason = event_data.get("message") or event_data.get("result_description") or "Payment failed"
             payment_doc.reference.update({
                 "status": "FAILED",
                 "errorMessage": failure_reason,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
-            print(f"FAILED: Payment {checkout_id} - {failure_reason}")
+            print(f"FAILED: Payment {transaction_id} - {failure_reason}")
+        else:
+            print(f"WARNING: Unknown event type: {event} with status: {status}")
 
         return jsonify({"message": "Callback processed"}), 200
 
@@ -805,6 +813,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
