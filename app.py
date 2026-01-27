@@ -39,6 +39,13 @@ MPESA_TILL_NUMBER = os.getenv("MPESA_TILL_NUMBER")   # The actual Till
 MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
 MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for sandbox, while CustomerBuyGoodsOnline for Live
 
+# Add Lipana configuration
+LIPANA_API_KEY = os.getenv("LIPANA_API_KEY")
+LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
+LIPANA_TILL_NUMBER = os.getenv("LIPANA_TILL_NUMBER")
+LIPANA_BASE_URL = "https://api.lipana.dev/v1" if LIPANA_ENVIRONMENT == "production" else "https://sandbox.lipana.dev/v1"
+LIPANA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/lipana-callback"
+
 # Signed URL TTLs
 MOVIE_TTL = 86400        # 24 hours
 SERIES_TTL = 86400       # 24 hours
@@ -506,154 +513,169 @@ def mpesa_stk_push():
 
     data = request.json
     print(f"DEBUG: Incoming Flutter Data: {data}")
-    phone = data["phone"] 
+    
+    phone = data["phone"]  # Should be in format 254XXXXXXXXX
     amount = int(data["amount"])
     item_id = data["item_id"]
     item_name = data["item_name"]
     item_type = data["item_type"]
 
-    # 1. Get Access Token (Standard for all M-Pesa APIs)
-    api_url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
-    r = requests.get(api_url, auth=HTTPBasicAuth(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET))
-    
-    if r.status_code != 200:
-        print(f"DEBUG: Token Error: {r.text}")
-        return jsonify({"error": "Failed to get access token"}), 500
-        
-    access_token = r.json()['access_token']
+    # Validate phone format
+    if not phone.startswith("254") or len(phone) != 12:
+        return jsonify({"error": "Phone must be in format 254XXXXXXXXX"}), 400
 
-    # 2. Generate Password using STORE_NUMBER (BusinessShortCode)
-    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    pass_str = f"{MPESA_STORE_NUMBER}{MPESA_PASSKEY}{timestamp}"
-    password = base64.b64encode(pass_str.encode()).decode()
-
-    # 3. Request STK Push for Buy Goods (Till)
-    stk_url = "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    safe_ref = item_name.replace(" ", "")[:12] if item_name else "Payment"
-    
-    payload = {
-        "BusinessShortCode": MPESA_STORE_NUMBER, # The Store Number
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": MPESA_TRANSACTION_TYPE, # CRITICAL for Till/ Paybill for sandbox
-        "Amount": amount,
-        "PartyA": phone, # Customer phone
-        "PartyB": MPESA_TILL_NUMBER, # The actual Till Number
-        "PhoneNumber": phone,
-        "CallBackURL": MPESA_CALLBACK_URL,
-        "AccountReference": safe_ref,
-        "TransactionDesc": f"Payment for {item_id}"
+    # Prepare Lipana request
+    lipana_payload = {
+        "amount": amount,
+        "phone_number": phone,
+        "account_reference": item_id[:12],  # Max 12 chars
+        "transaction_desc": f"Payment for {item_name}"[:20],  # Max 20 chars
+        "callback_url": LIPANA_CALLBACK_URL,
+        "till_number": LIPANA_TILL_NUMBER  # Use your till
     }
 
-    print(f"DEBUG: Safaricom Request Payload: {payload}")
-    res = requests.post(stk_url, json=payload, headers=headers)
-    res_data = res.json()
-    
-    print(f"DEBUG: Safaricom RAW Response: {res_data}")
-    if res.status_code == 200:
-        checkout_id = res_data["CheckoutRequestID"]
-        # Save to Firestore so Flutter Stream hears it
-        db.collection("users").document(uid).collection("payments").document(checkout_id).set({
-            "itemId": item_id,
-            "itemName": item_name,
-            "itemType": item_type,
-            "planType": data.get("planType", "monthly"),
-            "amount": amount,
-            "status": "PENDING",
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "checkoutRequestId": checkout_id,
-            "paymentType": "till_buy_goods"
-        })
-        return jsonify(res_data)
-    
-    return jsonify({"error": "Mpesa request failed", "details": res_data}), 400
-    
-@app.post("/v1/payments/callback")
-def mpesa_callback():
-    # LOG: See what Safaricom sends back after payment
-    print(f"DEBUG: Mpesa Callback Received: {request.json}")
+    headers = {
+        "Authorization": f"Bearer {LIPANA_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        data = request.json["Body"]["stkCallback"]
-        checkout_id = data["CheckoutRequestID"]
-        result_code = data["ResultCode"]
+        # Call Lipana STK Push endpoint
+        response = requests.post(
+            f"{LIPANA_BASE_URL}/stk-push",
+            json=lipana_payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        print(f"DEBUG: Lipana Response Status: {response.status_code}")
+        print(f"DEBUG: Lipana Response Body: {response.json()}")
 
-        payment_query = db.collection_group("payments").where("checkoutRequestId", "==", checkout_id).limit(1).get()
+        if response.status_code in [200, 201]:
+            lipana_data = response.json()
+            checkout_id = lipana_data.get("checkout_request_id") or lipana_data.get("CheckoutRequestID")
+            
+            # Save to Firestore
+            db.collection("users").document(uid).collection("payments").document(checkout_id).set({
+                "itemId": item_id,
+                "itemName": item_name,
+                "itemType": item_type,
+                "planType": data.get("planType", "monthly"),
+                "amount": amount,
+                "status": "PENDING",
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "checkoutRequestId": checkout_id,
+                "paymentProvider": "lipana",
+                "phoneNumber": phone
+            })
+            
+            return jsonify({
+                "CheckoutRequestID": checkout_id,
+                "CustomerMessage": lipana_data.get("customer_message", "STK Push sent"),
+                "ResponseCode": "0",
+                "ResponseDescription": "Success"
+            })
+        else:
+            error_data = response.json()
+            return jsonify({
+                "error": "Lipana request failed", 
+                "details": error_data
+            }), 400
+            
+    except Exception as e:
+        print(f"ERROR: Lipana STK Push failed: {str(e)}")
+        return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
+
+@app.post("/v1/payments/lipana-callback")
+def lipana_callback():
+    """Handles payment status updates from Lipana"""
+    print(f"DEBUG: Lipana Callback Received: {request.json}")
+
+    try:
+        data = request.json
+        
+        # Lipana sends a cleaner payload than raw Safaricom
+        checkout_id = data.get("checkout_request_id")
+        status = data.get("status")  # "SUCCESS", "FAILED", "CANCELLED"
+        mpesa_receipt = data.get("mpesa_receipt_number")
+        result_code = data.get("result_code", 0)
+        result_desc = data.get("result_description", "")
+
+        # Find the payment document
+        payment_query = db.collection_group("payments")\
+            .where("checkoutRequestId", "==", checkout_id)\
+            .limit(1).get()
 
         if not payment_query:
-            return jsonify({"ResultCode": 0})
+            print(f"WARNING: Payment not found for checkout {checkout_id}")
+            return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"}), 200
 
         payment_doc = payment_query[0]
         pay_data = payment_doc.to_dict()
         uid = payment_doc.reference.parent.parent.id
         
-        if pay_data.get("status") == "COMPLETED":
-            return jsonify({"ResultCode": 0})
+        # Prevent duplicate processing
+        if pay_data.get("status") in ["COMPLETED", "FAILED"]:
+            return jsonify({"ResultCode": 0, "ResultDesc": "Already processed"}), 200
 
-        if result_code != 0:
-            result_desc = data.get("ResultDesc", "Payment failed")
+        # Handle SUCCESS
+        if status == "SUCCESS" and result_code == 0:
+            payment_doc.reference.update({
+                "status": "COMPLETED",
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "mpesaReceipt": mpesa_receipt,
+                "resultDescription": result_desc
+            })
+
+            # Add to purchases
+            db.collection("users").document(uid).collection("purchases").add({
+                "amount": pay_data.get("amount"),
+                "currency": "KES",
+                "itemId": pay_data["itemId"],
+                "itemType": pay_data["itemType"],
+                "paymentMethod": "M-PESA",
+                "purchaseDate": firestore.SERVER_TIMESTAMP,
+                "purchaseStatus": "complete",
+                "receiptData": mpesa_receipt,
+            })
+
+            # Handle subscription if applicable
+            if pay_data["itemType"] == "subscription":
+                user = auth.get_user(uid)
+                current_claims = user.custom_claims or {}
+                durations = {"weekly": 7, "monthly": 30, "yearly": 365}
+                days = durations.get(pay_data.get("planType"), 30)
+                current_expiry = current_claims.get("premiumUntil", 0)
+                start_ts = max(time.time(), current_expiry)
+
+                new_expiry = datetime.fromtimestamp(start_ts) + timedelta(days=days)
+                new_ts = int(new_expiry.timestamp())
+
+                new_claims = current_claims.copy()
+                new_claims['premiumUntil'] = new_ts
+                auth.set_custom_user_claims(uid, new_claims)
+
+                db.collection("users").document(uid).update({
+                    "premiumUntil": new_ts,
+                    "isPremium": True
+                })
+
+            print(f"SUCCESS: Payment {checkout_id} completed with receipt {mpesa_receipt}")
+            
+        # Handle FAILED/CANCELLED
+        else:
             payment_doc.reference.update({
                 "status": "FAILED",
                 "errorCode": result_code,
                 "errorMessage": result_desc,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
-            print(f"DEBUG: Payment {checkout_id} marked as FAILED code {result_code}")
-            return jsonify({"ResultCode": result_code, "ResultDesc": result_desc})
+            print(f"FAILED: Payment {checkout_id} - {result_desc}")
 
-        # Safaricom sends metadata in a list of Key-Value pairs
-        metadata = data.get("CallbackMetadata", {}).get("Item", [])
-        receipt = next((item["Value"] for item in metadata if item["Name"] == "MpesaReceiptNumber"), "UNKNOWN")
+        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"}), 200
 
-        payment_doc.reference.update({
-            "status": "COMPLETED",
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "mpesaReceipt": receipt # Save the actual M-Pesa code
-        })
-
-        # Also add it to the purchase record
-        db.collection("users").document(uid).collection("purchases").add({
-            "amount": pay_data.get("amount"),
-            "currency": "KES",
-            "itemId": pay_data["itemId"],
-            "itemType": pay_data["itemType"],
-            "paymentMethod": "M-PESA",
-            "purchaseDate": firestore.SERVER_TIMESTAMP,
-            "purchaseStatus": "complete",
-            "receiptData": receipt,
-        })
-
-        # 3. IF SUBSCRIPTION: Update Custom Claims (The Merge Logic)
-        if pay_data["itemType"] == "subscription":
-            # Fetch current user to get existing claims (role, admin)
-            user = auth.get_user(uid)
-            current_claims = user.custom_claims or {}
-            durations = {"weekly": 7, "monthly": 30, "yearly": 365}
-            days = durations.get(pay_data.get("planType"), 30)
-            current_expiry = current_claims.get("premiumUntil", 0)
-            start_ts = max(time.time(), current_expiry)
-
-            new_expiry = datetime.fromtimestamp(start_ts) + timedelta(days=days)
-            new_ts = int(new_expiry.timestamp())
-
-            # Merge: Keep old keys, add/update premiumUntil
-            new_claims = current_claims.copy()
-            new_claims['premiumUntil'] = new_ts
-
-            # Set claims in Firebase Auth
-            auth.set_custom_user_claims(uid, new_claims)
-
-            # Update Firestore User Doc for UI/History
-            db.collection("users").document(uid).update({
-                "premiumUntil": new_ts,
-                "isPremium": True
-            })
-
-        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
     except Exception as e:
-        print(f"DEBUG: Callback processing error: {e}")
+        print(f"ERROR: Callback processing failed: {str(e)}")
         return jsonify({"ResultCode": 1, "ResultDesc": "Internal Error"}), 500
 
 @app.get("/v1/debug/config-check")
@@ -757,3 +779,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
