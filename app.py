@@ -41,15 +41,9 @@ MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for san
 
 # Add Lipana configuration
 LIPANA_TILL_NUMBER = os.getenv("LIPANA_TILL_NUMBER")
-LIPANA_SECRET_KEY = os.getenv("LIPANA_SECRET_KEY")  # lip_sk_test_...
+LIPANA_SECRET_KEY = os.getenv("LIPANA_SECRET_KEY")   # lip_sk_test_...
 LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
-
-# CORRECT URLs
-if LIPANA_ENVIRONMENT == "production":
-    LIPANA_BASE_URL = "https://api.lipana.dev/v1"
-else:
-    LIPANA_BASE_URL = "https://api.lipana.dev/sandbox"
-
+LIPANA_BASE_URL = "https://api.lipana.dev/v1" 
 LIPANA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/lipana-callback"
 
 # Signed URL TTLs
@@ -511,7 +505,7 @@ def get_b2_upload_token():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
+        
 @app.post("/v1/payments/stk-push")
 def mpesa_stk_push():
     uid, is_admin, decoded, err, code = require_auth()
@@ -532,24 +526,24 @@ def mpesa_stk_push():
 
     # Prepare Lipana STK Push request
     lipana_payload = {
-        "amount": amount,
-        "phone_number": phone,
-        "account_reference": item_id[:12],  # Max 12 chars
-        "transaction_desc": item_name[:20] if item_name else "Payment"  # Max 20 chars
+        "phone": phone,  # Changed from "phone_number" to "phone"
+        "amount": amount
     }
 
     headers = {
-        "Authorization": f"Bearer {LIPANA_SECRET_KEY}",
+        "x-api-key": LIPANA_SECRET_KEY,  # Changed from "Authorization: Bearer" to "x-api-key"
         "Content-Type": "application/json"
     }
 
-    print(f"DEBUG: Lipana URL: {LIPANA_BASE_URL}/stk-push")
+    # CORRECT endpoint: /transactions/push-stk
+    lipana_url = f"{LIPANA_BASE_URL}/transactions/push-stk"
+    print(f"DEBUG: Lipana URL: {lipana_url}")
     print(f"DEBUG: Lipana Payload: {lipana_payload}")
 
     try:
         # Call Lipana STK Push endpoint
         response = requests.post(
-            f"{LIPANA_BASE_URL}/stk-push",
+            lipana_url,
             json=lipana_payload,
             headers=headers,
             timeout=30
@@ -562,13 +556,14 @@ def mpesa_stk_push():
             lipana_data = response.json()
             
             # Lipana response structure
-            checkout_id = lipana_data.get("checkout_request_id")
+            checkout_id = lipana_data.get("data", {}).get("checkoutRequestID")
+            transaction_id = lipana_data.get("data", {}).get("transactionId")
             
             if not checkout_id:
-                print(f"ERROR: No checkout_request_id in response: {lipana_data}")
+                print(f"ERROR: No checkoutRequestID in response: {lipana_data}")
                 return jsonify({"error": "Invalid response from payment provider"}), 500
             
-            # Save to Firestore
+            # Save to Firestore using checkoutRequestID as document ID
             db.collection("users").document(uid).collection("payments").document(checkout_id).set({
                 "itemId": item_id,
                 "itemName": item_name,
@@ -578,6 +573,7 @@ def mpesa_stk_push():
                 "status": "PENDING",
                 "createdAt": firestore.SERVER_TIMESTAMP,
                 "checkoutRequestId": checkout_id,
+                "transactionId": transaction_id,
                 "paymentProvider": "lipana",
                 "phoneNumber": phone
             })
@@ -585,12 +581,12 @@ def mpesa_stk_push():
             # Return in Safaricom format (for Flutter compatibility)
             return jsonify({
                 "CheckoutRequestID": checkout_id,
-                "CustomerMessage": lipana_data.get("message", "STK Push sent to your phone"),
+                "CustomerMessage": lipana_data.get("data", {}).get("message", "STK Push sent to your phone"),
                 "ResponseCode": "0",
                 "ResponseDescription": "Success"
             })
         else:
-            error_data = response.json() if response.headers.get('content-type') == 'application/json' else {"error": response.text}
+            error_data = response.json() if 'application/json' in response.headers.get('content-type', '') else {"error": response.text}
             print(f"ERROR: Lipana returned {response.status_code}: {error_data}")
             return jsonify({
                 "error": "Payment request failed", 
@@ -603,8 +599,7 @@ def mpesa_stk_push():
     except Exception as e:
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
-
-
+        
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
     """Handles payment status updates from Lipana"""
@@ -810,6 +805,7 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
