@@ -31,6 +31,13 @@ B2_PRIVATE_BUCKET_ID = os.getenv("B2_PRIVATE_BUCKET_ID")
 B2_PUBLIC_BUCKET_NAME = os.getenv("B2_PUBLIC_BUCKET_NAME") 
 B2_PUBLIC_BUCKET_ID = os.getenv("B2_PUBLIC_BUCKET_ID")
 
+# --- CDN CONFIGURATION (NEW) ---
+CDN_DOMAIN = os.getenv("CDN_DOMAIN", "media.djmovieskenya.app")
+AUTH_SECRET = os.getenv("AUTH_SECRET")  # MUST MATCH Cloudflare Worker
+
+if not AUTH_SECRET:
+    raise ValueError("❌ AUTH_SECRET environment variable not set! This MUST match your Cloudflare Worker.")
+
 # --- MPESA CONFIG ---
 MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
 MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET")
@@ -44,14 +51,11 @@ MPESA_TRANSACTION_TYPE = 'CustomerPayBillOnline' # CustomerPayBillOnline for san
 LIPANA_TILL_NUMBER = os.getenv("LIPANA_TILL_NUMBER")
 LIPANA_SECRET_KEY = os.getenv("LIPANA_SECRET_KEY")   # lip_sk_test_...
 LIPANA_ENVIRONMENT = os.getenv("LIPANA_ENVIRONMENT", "sandbox")
-LIPANA_WEBHOOK_SECRET =  os.getenv("LIPANA_WEBHOOK_SECRET")
+LIPANA_WEBHOOK_SECRET = os.getenv("LIPANA_WEBHOOK_SECRET")
 LIPANA_BASE_URL = "https://api.lipana.dev/v1" 
 LIPANA_CALLBACK_URL = "https://backblaze-signer-api.onrender.com/v1/payments/lipana-callback"
 
-# Signed URL TTLs
-MOVIE_TTL = 86400        # 24 hours
-SERIES_TTL = 86400       # 24 hours
-COLLECTION_TTL = 86400   # 24 hours
+# TTLs
 MAX_THREADS = 10
 
 # Initialize Firebase
@@ -68,8 +72,7 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CACHING ---
-# This is the "secret sauce": Python expires its cache BEFORE Flutter's 20h buffer
-signed_url_cache = TTLCache(maxsize=5000, ttl=64800)
+# Cache user purchases for 1 minute to reduce Firestore reads
 user_purchase_cache = TTLCache(maxsize=2000, ttl=60)
 
 # --- AUTH & ENTITLEMENT ---
@@ -84,7 +87,8 @@ def require_auth() -> Tuple[Optional[str], bool, Optional[dict], Optional[Respon
         uid = decoded["uid"]
         is_admin = decoded.get("admin", False)
         return uid, is_admin, decoded, None, None
-    except Exception:
+    except Exception as e:
+        print(f"Auth error: {e}")
         return None, False, None, jsonify({"error": "Auth failed"}), 401
 
 
@@ -101,7 +105,8 @@ def get_user_purchases(uid: str) -> List[Dict]:
     user_purchase_cache[uid] = purchases
     return purchases
 
-def assert_entitlement(uid: str,is_admin: bool,decoded: dict,content_id: str,content_type: str,parent_id: str = None,part_id: str = None):
+def assert_entitlement(uid: str, is_admin: bool, decoded: dict, content_id: str, 
+                       content_type: str, parent_id: str = None, part_id: str = None):
     """
     Check if user has access to the content.
     - Admin / Premium users bypass checks
@@ -148,29 +153,82 @@ def assert_entitlement(uid: str,is_admin: bool,decoded: dict,content_id: str,con
             f"Access denied to {content_type} {content_id}"
             + (f" (parent {parent_id})" if parent_id else "")
         )
-        
-# --- B2 CORE HELPERS ---
+
+# ============================================
+# CDN URL GENERATION (REPLACES sign_b2)
+# ============================================
+
+def generate_cdn_url(file_path: str) -> dict:
+    """
+    Generate hour-aligned signed URL for Cloudflare CDN.
+    Token rotates at top of each hour (9:00, 10:00, 11:00, etc.)
+    This MUST match the Worker's validation logic.
+    
+    Args:
+        file_path: Path to file (e.g., "/hls/movie-123/index.m3u8")
+    
+    Returns:
+        dict with 'url' and 'expiresIn' (seconds until token expires)
+    """
+    # Align to hour boundary (UTC)
+    current_hour = int(time.time() // 3600)
+    expiry = (current_hour + 1) * 3600
+    
+    # Ensure path starts with /
+    if not file_path.startswith("/"):
+        file_path = f"/{file_path}"
+    
+    # Generate HMAC signature (MUST match Worker's validation)
+    data = f"{file_path}{expiry}"
+    signature = hmac.new(
+        AUTH_SECRET.encode(),
+        data.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Build CDN URL
+    cdn_url = f"https://{CDN_DOMAIN}{file_path}?token={signature}&expires={expiry}"
+    
+    # Calculate seconds until expiry
+    expires_in = expiry - int(time.time())
+    
+    return {
+        "url": cdn_url,
+        "expiresIn": expires_in
+    }
+
+# ============================================
+# B2 CORE HELPERS (For Admin Operations Only)
+# ============================================
 b2_auth_store = {
     "private": {"expires": datetime.min, "data": None},
     "public":  {"expires": datetime.min, "data": None}
 }
-# Set the TTLCache to 18 hours (64800 seconds)
 
 def authorize_b2(is_public=False):
+    """
+    B2 authorization - now only used for:
+    - Admin file management
+    - Direct uploads
+    - Orphan cleanup
+    
+    NOT used for video playback URLs anymore (CDN handles that)
+    """
     global b2_auth_store
     scope_key = "public" if is_public else "private"
+    
     # Check specific cache for this scope
     if datetime.utcnow() < b2_auth_store[scope_key]["expires"]:
-        print(f"DEBUG: Using cached B2 auth for {scope_key}")
         return b2_auth_store[scope_key]["data"]
+    
     print(f"DEBUG: Authorizing B2 for {scope_key.upper()} bucket...")
     
     key_id = B2_PUBLIC_KEY_ID if is_public else B2_PRIVATE_KEY_ID
     app_key = B2_PUBLIC_APP_KEY if is_public else B2_PRIVATE_APP_KEY
     
     if not key_id or not app_key:
-        print(f"ERROR: Missing keys for {scope_key} storage")
         raise ValueError(f"B2 Keys not found for {scope_key}")
+    
     r = requests.get(
         "https://api.backblazeb2.com/b2api/v2/b2_authorize_account", 
         auth=(key_id, app_key)
@@ -181,28 +239,11 @@ def authorize_b2(is_public=False):
         r.raise_for_status()
         
     data = r.json()
-    # Save to the specific scope key
     b2_auth_store[scope_key] = {
         "data": data, 
         "expires": datetime.utcnow() + timedelta(hours=23)
     }
     return data
-
-def sign_b2(file_path: str, expires: int) -> str:
-    cache_key = f"{B2_PRIVATE_BUCKET_ID}:{file_path}:{expires}"
-    if cache_key in signed_url_cache:
-        return signed_url_cache[cache_key]
-    auth_data = authorize_b2()
-    r = requests.post(
-        f"{auth_data['apiUrl']}/b2api/v2/b2_get_download_authorization",
-        headers={"Authorization": auth_data["authorizationToken"]},
-        json={"bucketId": B2_PRIVATE_BUCKET_ID, "fileNamePrefix": file_path, "validDurationInSeconds": expires}
-    )
-    r.raise_for_status()
-    token = r.json()["authorizationToken"]
-    url = f"{auth_data['downloadUrl']}/file/{B2_PRIVATE_BUCKET_NAME}/{file_path}?Authorization={token}"
-    signed_url_cache[cache_key] = url
-    return url
 
 def delete_b2_file(file_path: str, file_id: str) -> bool:
     """Permanently removes a file version from Backblaze."""
@@ -241,7 +282,8 @@ def get_all_orphans():
         for f in data.get("files", []):
             all_b2_files[f["fileName"]] = f["fileId"]
         next_file_name = data.get("nextFileName")
-        if not next_file_name: break
+        if not next_file_name: 
+            break
 
     # Step 2: Collect all Firestore video paths
     db_paths = set()
@@ -264,8 +306,12 @@ def get_all_orphans():
     orphans = [{"path": p, "id": i} for p, i in all_b2_files.items() if p not in db_paths]
     return orphans
 
-# --- API ROUTES ---
+# ============================================
+# API ROUTES - VIDEO PLAYBACK
+# ============================================
+
 def is_free(data: dict) -> bool:
+    """Check if content is free"""
     try:
         return int(data.get("price", 0)) == 0
     except (TypeError, ValueError):
@@ -273,42 +319,55 @@ def is_free(data: dict) -> bool:
 
 @app.post("/sign/movie")
 def sign_movie():
+    """Generate CDN URL for a movie"""
     uid, is_admin, decoded, err, code = require_auth()
     if err:
         return err, code
 
-    movie_id = request.json["movieId"]
-    doc = db.collection("movies").document(movie_id).get()
-
-    if not doc.exists:
-        return jsonify({"error": "Not found"}), 404
+    movie_id = request.json.get("movieId")
+    if not movie_id:
+        return jsonify({"error": "movieId required"}), 400
     
-    try:
-        assert_entitlement(uid, is_admin, decoded, movie_id, "movie")
-    except PermissionError:
-        if not is_free(doc.to_dict()):
-            return jsonify({"error": "Access denied"}), 403
+    doc = db.collection("movies").document(movie_id).get()
+    if not doc.exists:
+        return jsonify({"error": "Movie not found"}), 404
     
     movie = doc.to_dict()
     
-    return jsonify({
-        "url": sign_b2(movie["videoPath"], MOVIE_TTL),
-        "expiresIn": MOVIE_TTL
-    })
+    # Check entitlement (skip for free content)
+    try:
+        assert_entitlement(uid, is_admin, decoded, movie_id, "movie")
+    except PermissionError:
+        if not is_free(movie):
+            return jsonify({"error": "Access denied"}), 403
+    
+    # Generate CDN URL
+    video_path = movie.get("videoPath")
+    if not video_path:
+        return jsonify({"error": "Video path not found"}), 404
+    
+    result = generate_cdn_url(video_path)
+    return jsonify(result)
+
+
 @app.post("/sign/series")
 def sign_series():
     """Signs all parts in a series (for bulk loading/pre-caching)."""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: return err, code
+    if err: 
+        return err, code
 
     series_id = request.json.get("seriesId")
+    if not series_id:
+        return jsonify({"error": "seriesId required"}), 400
+    
     doc = db.collection("series").document(series_id).get()
-
     if not doc.exists:
         return jsonify({"error": "Series not found"}), 404
     
     series_data = doc.to_dict()
     
+    # Check entitlement
     try:
         assert_entitlement(uid, is_admin, decoded, series_id, "series")
     except PermissionError:
@@ -319,18 +378,22 @@ def sign_series():
     signed_parts = []
 
     for p in parts:
-        # Using 'videoPath' and 'partName' from your doc example
+        video_path = p.get("videoPath")
+        if not video_path:
+            continue
+            
+        cdn_data = generate_cdn_url(video_path)
         signed_parts.append({
             "partId": p.get("partId"),
             "partName": p.get("partName"),
-            "url": sign_b2(p["videoPath"], SERIES_TTL),
-            "expiresIn": SERIES_TTL
+            "url": cdn_data["url"],
+            "expiresIn": cdn_data["expiresIn"]
         })
 
     return jsonify({
         "seriesId": series_id,
         "parts": signed_parts,
-        "expiresIn": SERIES_TTL
+        "expiresIn": signed_parts[0]["expiresIn"] if signed_parts else 3600
     })
 
 
@@ -338,11 +401,15 @@ def sign_series():
 def sign_series_part():
     """Signs a single specific part by searching the parts array."""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: return err, code
+    if err: 
+        return err, code
 
     data = request.json
     series_id = data.get("seriesId")
     part_id = data.get("partId")
+    
+    if not series_id or not part_id:
+        return jsonify({"error": "seriesId and partId required"}), 400
 
     doc = db.collection("series").document(series_id).get()
     if not doc.exists:
@@ -356,6 +423,7 @@ def sign_series_part():
     if not part:
         return jsonify({"error": "Part not found"}), 404
 
+    # Check entitlement
     try:
         assert_entitlement(uid, is_admin, decoded, series_id, "series")
     except PermissionError:
@@ -363,125 +431,184 @@ def sign_series_part():
         if not is_free(series_data) and not is_free(part):
             return jsonify({"error": "Access denied"}), 403
 
+    video_path = part.get("videoPath")
+    if not video_path:
+        return jsonify({"error": "Video path not found"}), 404
+    
+    cdn_data = generate_cdn_url(video_path)
+    
     return jsonify({
         "seriesId": series_id,
         "partId": part_id,
-        "url": sign_b2(part["videoPath"], SERIES_TTL),
-        "expiresIn": SERIES_TTL
+        "url": cdn_data["url"],
+        "expiresIn": cdn_data["expiresIn"]
     })
-    
+
+
 @app.post("/sign/collection")
 def sign_collection():
+    """Generate CDN URLs for all movies in a collection"""
     uid, is_admin, decoded, err, code = require_auth()
     if err:
         return err, code
 
-    collection_id = request.json["collectionId"]
+    collection_id = request.json.get("collectionId")
+    if not collection_id:
+        return jsonify({"error": "collectionId required"}), 400
+    
     coll_ref = db.collection("collections").document(collection_id).get()
     if not coll_ref.exists:
-        return jsonify({"error": "Not found"}), 404
-        
+        return jsonify({"error": "Collection not found"}), 404
+    
+    coll = coll_ref.to_dict()
+    
+    # Check entitlement
     try:
-        assert_entitlement(uid,is_admin,decoded,collection_id,"collection")
+        assert_entitlement(uid, is_admin, decoded, collection_id, "collection")
     except PermissionError:
-        if not is_free(coll_ref.to_dict()):
+        if not is_free(coll):
             return jsonify({"error": "Access denied"}), 403
 
-    coll = coll_ref.to_dict()
     signed = []
-
     for m in coll.get("movies", []):
+        video_path = m.get("videoPath")
+        if not video_path:
+            continue
+            
+        cdn_data = generate_cdn_url(video_path)
         signed.append({
-            "movieId": m["movieId"],
-            "url": sign_b2(m["videoPath"], COLLECTION_TTL),
-            "expiresIn": COLLECTION_TTL
+            "movieId": m.get("movieId"),
+            "url": cdn_data["url"],
+            "expiresIn": cdn_data["expiresIn"]
         })
 
     return jsonify({
         "collectionId": collection_id,
         "movies": signed,
-        "expiresIn": COLLECTION_TTL
+        "expiresIn": signed[0]["expiresIn"] if signed else 3600
     })
 
-        
+
 @app.post("/sign/collection/movie")
 def sign_collection_movie():
+    """Generate CDN URL for a specific movie in a collection"""
     uid, is_admin, decoded, err, code = require_auth()
     if err:
         return err, code
 
-    movie_id = request.json["movieId"]
-    collection_id = request.json["collectionId"]
+    movie_id = request.json.get("movieId")
+    collection_id = request.json.get("collectionId")
+    
+    if not movie_id or not collection_id:
+        return jsonify({"error": "movieId and collectionId required"}), 400
+    
     coll_ref = db.collection("collections").document(collection_id).get()
     if not coll_ref.exists:
-        return jsonify({"error": "Not found"}), 404
+        return jsonify({"error": "Collection not found"}), 404
 
     movie = next(
         (m for m in coll_ref.to_dict().get("movies", [])
-         if m["movieId"] == movie_id),
+         if m.get("movieId") == movie_id),
         None
     )
     
     if not movie:
-        return jsonify({"error": "Not found"}), 404
-        
+        return jsonify({"error": "Movie not found in collection"}), 404
+    
+    # Check entitlement
     try:
-        assert_entitlement(uid,is_admin,decoded,movie_id,"collectionMovie",parent_id=collection_id)
+        assert_entitlement(uid, is_admin, decoded, movie_id, "collectionMovie", parent_id=collection_id)
     except PermissionError:
         if not is_free(movie):
             return jsonify({"error": "Access denied"}), 403
 
+    video_path = movie.get("videoPath")
+    if not video_path:
+        return jsonify({"error": "Video path not found"}), 404
+    
+    cdn_data = generate_cdn_url(video_path)
+    
     return jsonify({
         "movieId": movie_id,
-        "url": sign_b2(movie["videoPath"], MOVIE_TTL),
-        "expiresIn": MOVIE_TTL
+        "url": cdn_data["url"],
+        "expiresIn": cdn_data["expiresIn"]
     })
+
+# ============================================
+# ADMIN ROUTES
+# ============================================
 
 @app.delete("/content/movie/<movie_id>")
 def delete_movie(movie_id):
+    """Delete a movie (owner or admin only)"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: return err, code
+    if err: 
+        return err, code
     
     doc_ref = db.collection("movies").document(movie_id)
     doc = doc_ref.get()
-    if not doc.exists: return jsonify({"error": "Not found"}), 404
+    if not doc.exists: 
+        return jsonify({"error": "Not found"}), 404
     
     data = doc.to_dict()
+    
     # Security: Owner or Admin only
     if not is_admin and data.get("uploaderId") != uid:
         return jsonify({"error": "Unauthorized"}), 403
 
     b2_success = delete_b2_file(data.get("videoPath"), data.get("fileId"))
     doc_ref.delete()
+    
     return jsonify({"success": True, "b2_deleted": b2_success})
+
 
 @app.get("/admin/cleanup/orphans")
 def list_orphans():
+    """List all orphaned B2 files (admin only)"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err or not is_admin: return jsonify({"error": "Admin only"}), 403
+    if err or not is_admin: 
+        return jsonify({"error": "Admin only"}), 403
+    
     orphans = get_all_orphans()
     return jsonify({"count": len(orphans), "orphans": orphans})
 
+
 @app.post("/admin/cleanup/purge-orphans")
 def purge_orphans():
+    """Delete all orphaned B2 files (admin only)"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err or not is_admin: return jsonify({"error": "Admin only"}), 403
+    if err or not is_admin: 
+        return jsonify({"error": "Admin only"}), 403
 
     dry_run = request.args.get("dry_run", "true").lower() == "true"
     orphans = get_all_orphans()
     
     if dry_run:
-        return jsonify({"mode": "DRY RUN", "would_delete": len(orphans), "orphans": orphans})
+        return jsonify({
+            "mode": "DRY RUN", 
+            "would_delete": len(orphans), 
+            "orphans": orphans
+        })
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
         results = list(ex.map(lambda o: delete_b2_file(o["path"], o["id"]), orphans))
     
-    return jsonify({"mode": "LIVE PURGE", "deleted": results.count(True), "failed": results.count(False)})
+    return jsonify({
+        "mode": "LIVE PURGE", 
+        "deleted": results.count(True), 
+        "failed": results.count(False)
+    })
+
+# ============================================
+# B2 UPLOAD TOKEN (For Direct Uploads)
+# ============================================
 
 @app.post("/v1/auth/b2-token")
 def get_b2_upload_token():
+    """Get B2 upload token for direct uploads from Flutter"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: return err, code
+    if err: 
+        return err, code
     
     try:
         data = request.json or {}
@@ -500,30 +627,35 @@ def get_b2_upload_token():
         r.raise_for_status()
         data = r.json()
         
-        # Return what the DirectUploadService expects
         return jsonify({
             "uploadUrl": data["uploadUrl"],
             "uploadAuthToken": data["authorizationToken"]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-        
+
+# ============================================
+# PAYMENT ROUTES (Lipana Integration)
+# ============================================
+
 @app.post("/v1/payments/stk-push")
 def mpesa_stk_push():
+    """Initiate M-PESA STK push via Lipana"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: return err, code
+    if err: 
+        return err, code
 
     data = request.json
     print(f"DEBUG: Incoming Flutter Data: {data}")
     
-    phone = data["phone"]
-    amount = int(data["amount"])
-    item_id = data["item_id"]
-    item_name = data["item_name"]
-    item_type = data["item_type"]
+    phone = data.get("phone")
+    amount = int(data.get("amount"))
+    item_id = data.get("item_id")
+    item_name = data.get("item_name")
+    item_type = data.get("item_type")
 
     # Validate phone format
-    if not phone.startswith("254") or len(phone) != 12:
+    if not phone or not phone.startswith("254") or len(phone) != 12:
         return jsonify({"error": "Phone must be in format 254XXXXXXXXX"}), 400
 
     # Prepare Lipana STK Push request
@@ -538,8 +670,6 @@ def mpesa_stk_push():
     }
 
     lipana_url = f"{LIPANA_BASE_URL}/transactions/push-stk"
-    print(f"DEBUG: Lipana URL: {lipana_url}")
-    print(f"DEBUG: Lipana Payload: {lipana_payload}")
 
     try:
         response = requests.post(
@@ -556,15 +686,14 @@ def mpesa_stk_push():
             lipana_data = response.json()
             response_data = lipana_data.get("data", {})
             
-            # Lipana uses transactionId, not checkoutRequestID
             transaction_id = response_data.get("transactionId")
-            checkout_id = response_data.get("checkoutRequestID") or transaction_id  # Fallback to transactionId
+            checkout_id = response_data.get("checkoutRequestID") or transaction_id
             
             if not transaction_id:
                 print(f"ERROR: No transactionId in response: {lipana_data}")
                 return jsonify({"error": "Invalid response from payment provider"}), 500
             
-            # Use transaction_id as the document ID (since that's what Lipana uses)
+            # Store payment in Firestore
             db.collection("users").document(uid).collection("payments").document(transaction_id).set({
                 "itemId": item_id,
                 "itemName": item_name,
@@ -573,15 +702,14 @@ def mpesa_stk_push():
                 "amount": amount,
                 "status": "PENDING",
                 "createdAt": firestore.SERVER_TIMESTAMP,
-                "checkoutRequestId": checkout_id,  # For Flutter compatibility
-                "transactionId": transaction_id,    # Lipana's actual ID
+                "checkoutRequestId": checkout_id,
+                "transactionId": transaction_id,
                 "paymentProvider": "lipana",
                 "phoneNumber": phone
             })
             
-            # Return in format Flutter expects (using transactionId as CheckoutRequestID)
             return jsonify({
-                "CheckoutRequestID": transaction_id,  # Use transactionId here
+                "CheckoutRequestID": transaction_id,
                 "CustomerMessage": response_data.get("message", "STK Push sent to your phone"),
                 "ResponseCode": "0",
                 "ResponseDescription": "Success"
@@ -601,25 +729,22 @@ def mpesa_stk_push():
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
 
+
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
     """Handles payment status updates from Lipana"""
     
-    # STEP 1: Verify webhook signature (IMPORTANT FOR SECURITY)
+    # Verify webhook signature
     signature = request.headers.get('X-Lipana-Signature') or request.headers.get('x-lipana-signature')
     
     if signature and LIPANA_WEBHOOK_SECRET:
-        # Get raw request body
         payload = request.get_data()
-        
-        # Compute expected signature
         expected_signature = hmac.new(
             LIPANA_WEBHOOK_SECRET.encode(),
             payload,
             hashlib.sha256
         ).hexdigest()
         
-        # Verify signature
         if not hmac.compare_digest(signature, expected_signature):
             print("ERROR: Invalid webhook signature")
             return jsonify({"error": "Unauthorized"}), 401
@@ -628,12 +753,9 @@ def lipana_callback():
 
     try:
         data = request.json
-        
-        # Lipana callback structure
         event = data.get("event")
         event_data = data.get("data", {})
         
-        # Get transaction ID
         transaction_id = event_data.get("transactionId") or event_data.get("transaction_id")
         status = event_data.get("status")
         mpesa_receipt = event_data.get("mpesaReceiptNumber") or event_data.get("receipt_number")
@@ -685,7 +807,7 @@ def lipana_callback():
                 "receiptData": mpesa_receipt or "LIPANA_" + transaction_id,
             })
 
-            # Handle subscription if applicable
+            # Handle subscription
             if pay_data.get("itemType") == "subscription":
                 user = auth.get_user(uid)
                 current_claims = user.custom_claims or {}
@@ -728,6 +850,7 @@ def lipana_callback():
         traceback.print_exc()
         return jsonify({"message": "Internal error"}), 500
 
+
 @app.post("/v1/payments/test-complete/<transaction_id>")
 def test_complete_payment(transaction_id):
     """Manual endpoint to complete a payment (for testing only)"""
@@ -747,7 +870,6 @@ def test_complete_payment(transaction_id):
         }
     }
     
-    # Call your own callback
     try:
         with app.test_request_context(
             '/v1/payments/lipana-callback',
@@ -761,60 +883,27 @@ def test_complete_payment(transaction_id):
             })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-        
-@app.get("/v1/debug/config-check")
-def config_check():
-    """Checks if Environment Variables are loaded without showing full secrets."""
-    uid, is_admin, decoded, err, code = require_auth()
-    if err or not is_admin: 
-        return jsonify({"error": "Admin only"}), 403
 
-    config_status = {
-        "MPESA_CONSUMER_KEY_LOADED": bool(os.getenv("MPESA_CONSUMER_KEY")),
-        "MPESA_CONSUMER_SECRET_LOADED": bool(os.getenv("MPESA_CONSUMER_SECRET")),
-        "MPESA_PASSKEY_LOADED": bool(os.getenv("MPESA_PASSKEY")),
-        "MPESA_STORE_NUMBER": os.getenv("MPESA_STORE_NUMBER"),
-        "MPESA_TILL_NUMBER": os.getenv("MPESA_TILL_NUMBER"),
-        "FIREBASE_SECRET_FILE_EXISTS": os.path.exists("/etc/secrets/serviceAccountKey.json"),
-        "ENV_MODE": "Production" if os.getenv("RENDER") else "Local",
-        "LIPANA_SECRET_KEY_LOADED": bool(LIPANA_SECRET_KEY),
-        "LIPANA_SECRET_KEY_PREFIX": LIPANA_SECRET_KEY[:15] if LIPANA_SECRET_KEY else None,
-        "LIPANA_ENVIRONMENT": LIPANA_ENVIRONMENT,
-        "LIPANA_BASE_URL": LIPANA_BASE_URL,
-        "LIPANA_CALLBACK_URL": LIPANA_CALLBACK_URL,
-        "LIPANA_WEBHOOK_SECRET": LIPANA_WEBHOOK_SECRET,
-    }
-    
-    # Log it to Render console too
-    print(f"DEBUG CONFIG CHECK: {config_status}")
-    return jsonify(config_status)
+# ============================================
+# TV AUTH
+# ============================================
 
-# --- TV AUTH CONFIG ---
-# We use a short 5-minute window for pairing codes
 DEVICE_CODE_TTL_MINUTES = 5
 
 @app.post("/v1/auth/verify-tv-code")
 def verify_tv_code():
-    """
-    Called by the MOBILE app to approve a code shown on the TV.
-    """
-    print("--- DEBUG: verify_tv_code started ---")
-    
-    # Use your existing auth helper to ensure the Mobile user is logged in
-    uid, is_admin, err, code = require_auth()
+    """Called by mobile app to approve a code shown on TV"""
+    uid, is_admin, decoded, err, code = require_auth()
     if err:
-        print(f"--- DEBUG: auth failed: {err}")
         return err, code
 
-    print(f"--- DEBUG: authenticated user: {uid}")
     try:
         data = request.json
-        device_code = data.get("code").upper().strip()
+        device_code = data.get("code", "").upper().strip()
         
         if not device_code:
             return jsonify({"error": "Code is required"}), 400
 
-        # 1. Check if the code exists in Firestore
         code_ref = db.collection('device_auth_requests').document(device_code)
         doc = code_ref.get()
         
@@ -822,32 +911,27 @@ def verify_tv_code():
             return jsonify({"error": "Code not found or expired"}), 404
             
         doc_data = doc.to_dict()
-        
-        # 2. Verify expiry (Safety check)
         created_at = doc_data.get('createdAt')
+        
         if not created_at:
             return jsonify({"error": "Invalid code data"}), 400
             
-        # Check if the code is older than 5 minutes
-        # Note: server_timestamp returns a datetime object in Python
+        # Check expiry
         now = datetime.utcnow()
         if now > created_at + timedelta(minutes=DEVICE_CODE_TTL_MINUTES):
-            code_ref.delete() # Cleanup expired code
+            code_ref.delete()
             return jsonify({"error": "Code has expired"}), 403
 
         if doc_data.get('status') != 'pending':
-             return jsonify({"error": "Code already used or invalid"}), 400
+            return jsonify({"error": "Code already used or invalid"}), 400
 
-        # 3. MINT CUSTOM TOKEN
-        # Since you are using the Firebase Admin SDK, you CAN create a custom token.
-        # This is allowed on the free tier of Firebase as long as you use the Admin SDK 
-        # inside your own server (Render).
+        # Create custom token
         custom_token = auth.create_custom_token(uid)
         
         if isinstance(custom_token, bytes):
             custom_token = custom_token.decode('utf-8')
 
-        # 4. Update Firestore to trigger the TV's listener
+        # Update Firestore
         code_ref.update({
             'status': 'approved',
             'token': custom_token,
@@ -860,19 +944,49 @@ def verify_tv_code():
     except Exception as e:
         print(f"TV Auth Error: {e}")
         return jsonify({"error": str(e)}), 500
+
+# ============================================
+# DEBUG & HEALTH ROUTES
+# ============================================
+
+@app.get("/v1/debug/config-check")
+def config_check():
+    """Check environment configuration (admin only)"""
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin: 
+        return jsonify({"error": "Admin only"}), 403
+
+    config_status = {
+        "AUTH_SECRET_LOADED": bool(AUTH_SECRET),
+        "AUTH_SECRET_LENGTH": len(AUTH_SECRET) if AUTH_SECRET else 0,
+        "CDN_DOMAIN": CDN_DOMAIN,
+        "B2_PRIVATE_BUCKET": B2_PRIVATE_BUCKET_NAME,
+        "B2_PUBLIC_BUCKET": B2_PUBLIC_BUCKET_NAME,
+        "MPESA_CONFIGURED": bool(MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET),
+        "LIPANA_CONFIGURED": bool(LIPANA_SECRET_KEY),
+        "LIPANA_ENVIRONMENT": LIPANA_ENVIRONMENT,
+        "FIREBASE_SECRET_FILE_EXISTS": os.path.exists("/etc/secrets/serviceAccountKey.json"),
+        "ENV_MODE": "Production" if os.getenv("RENDER") else "Local",
+    }
     
+    print(f"DEBUG CONFIG CHECK: {config_status}")
+    return jsonify(config_status)
+
+
 @app.get("/health")
 @app.get("/")
 def health():
-    return {"status": "ok"}, 200
+    """Health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "cdn_enabled": bool(AUTH_SECRET),
+        "cdn_domain": CDN_DOMAIN
+    }), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    print(f"\n🚀 Starting server on port {port}")
+    print(f"📡 CDN Domain: {CDN_DOMAIN}")
+    print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
