@@ -948,15 +948,23 @@ def verify_tv_code():
 # ============================================
 # TITLE LOCK
 # ============================================
-def build_lock_key(category: str, normalized_title: str, dj_name: str | None):
+def build_lock_key(category: str, normalized_title: str, dj_name: str | None = None, dj_names: list[str] | None = None):
+    """
+    Build a unique lock key:
+    - Movies/Series: normalized_title + optional dj_name
+    - Collections: normalized_title + sorted list of dj_names
+    """
     base = normalized_title.lower().replace(" ", "_")
 
-    if category == "collections" and dj_name:
-        dj_slug = dj_name.lower().replace(" ", "_")
+    if category == "collections" and dj_names:
+        dj_slug = "_".join(sorted([dj.lower().replace(" ", "_") for dj in dj_names]))
         return f"{base}__{dj_slug}"
+    
+    if category in ["movies", "series"] and dj_name:
+        return f"{base}__{dj_name.lower().replace(' ', '_')}"
 
     return base
-    
+
 @app.post("/admin/title-lock/acquire")
 def acquire_title_lock():
     uid, is_admin, decoded, err, code = require_auth()
@@ -966,33 +974,33 @@ def acquire_title_lock():
     data = request.json or {}
     category = data.get("category")
     normalized_title = data.get("normalizedTitle")
-    dj_name = data.get("djName")
+    dj_name = data.get("djName")          # for movies/series
+    dj_names = data.get("djNames")        # for collections
     exclude_doc_id = data.get("excludeDocId")
 
     if not category or not normalized_title:
         return jsonify({"error": "category and normalizedTitle required"}), 400
-
     if category not in ["movies", "series", "collections"]:
         return jsonify({"error": "Invalid category"}), 400
 
-    lock_key = build_lock_key(category, normalized_title, dj_name)
+    lock_key = build_lock_key(category, normalized_title, dj_name, dj_names)
     doc_id = f"{category}__{lock_key}"
     lock_ref = db.collection("title_locks").document(doc_id)
 
     try:
         def txn(transaction):
             snap = transaction.get(lock_ref)
-
             if snap.exists:
                 existing = snap.to_dict()
                 if exclude_doc_id and existing.get("posterId") == exclude_doc_id:
                     return  # editing same document
-
                 raise ValueError("DUPLICATE")
 
             transaction.set(lock_ref, {
                 "category": category,
                 "normalizedTitle": normalized_title,
+                "djName": dj_name if category in ["movies", "series"] else None,
+                "djNames": dj_names if category == "collections" else [],
                 "posterId": exclude_doc_id,
                 "createdBy": uid,
                 "createdAt": firestore.SERVER_TIMESTAMP
@@ -1000,15 +1008,12 @@ def acquire_title_lock():
 
         db.transaction()(txn)
 
-        return jsonify({
-            "success": True,
-            "lockKey": lock_key
-        })
+        return jsonify({"success": True, "lockKey": lock_key})
 
     except ValueError:
         return jsonify({
             "success": False,
-            "reason": f"A {category[:-1]} with this title already exists"
+            "reason": f"A {category[:-1]} with this title and DJ(s) already exists"
         }), 409
 
 @app.post("/admin/title-lock/update")
@@ -1027,7 +1032,6 @@ def update_title_lock():
 
     doc_id = f"{category}__{lock_key}"
     lock_ref = db.collection("title_locks").document(doc_id)
-
     lock_ref.update({
         "posterId": poster_id,
         "updatedAt": firestore.SERVER_TIMESTAMP
@@ -1098,4 +1102,5 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
