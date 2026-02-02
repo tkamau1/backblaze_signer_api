@@ -153,7 +153,7 @@ def assert_entitlement(uid: str, is_admin: bool, decoded: dict, content_id: str,
             f"Access denied to {content_type} {content_id}"
             + (f" (parent {parent_id})" if parent_id else "")
         )
-
+    
 # ============================================
 # CDN URL GENERATION (REPLACES sign_b2)
 # ============================================
@@ -946,6 +946,114 @@ def verify_tv_code():
         return jsonify({"error": str(e)}), 500
 
 # ============================================
+# TITLE LOCK
+# ============================================
+def build_lock_key(category: str, normalized_title: str, dj_name: str | None):
+    base = normalized_title.lower().replace(" ", "_")
+
+    if category == "collections" and dj_name:
+        dj_slug = dj_name.lower().replace(" ", "_")
+        return f"{base}__{dj_slug}"
+
+    return base
+    
+@app.post("/admin/title-lock/acquire")
+def acquire_title_lock():
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    data = request.json or {}
+    category = data.get("category")
+    normalized_title = data.get("normalizedTitle")
+    dj_name = data.get("djName")
+    exclude_doc_id = data.get("excludeDocId")
+
+    if not category or not normalized_title:
+        return jsonify({"error": "category and normalizedTitle required"}), 400
+
+    if category not in ["movies", "series", "collections"]:
+        return jsonify({"error": "Invalid category"}), 400
+
+    lock_key = build_lock_key(category, normalized_title, dj_name)
+    doc_id = f"{category}__{lock_key}"
+    lock_ref = db.collection("title_locks").document(doc_id)
+
+    try:
+        def txn(transaction):
+            snap = transaction.get(lock_ref)
+
+            if snap.exists:
+                existing = snap.to_dict()
+                if exclude_doc_id and existing.get("posterId") == exclude_doc_id:
+                    return  # editing same document
+
+                raise ValueError("DUPLICATE")
+
+            transaction.set(lock_ref, {
+                "category": category,
+                "normalizedTitle": normalized_title,
+                "posterId": exclude_doc_id,
+                "createdBy": uid,
+                "createdAt": firestore.SERVER_TIMESTAMP
+            })
+
+        db.transaction()(txn)
+
+        return jsonify({
+            "success": True,
+            "lockKey": lock_key
+        })
+
+    except ValueError:
+        return jsonify({
+            "success": False,
+            "reason": f"A {category[:-1]} with this title already exists"
+        }), 409
+
+@app.post("/admin/title-lock/update")
+def update_title_lock():
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    data = request.json or {}
+    category = data.get("category")
+    lock_key = data.get("lockKey")
+    poster_id = data.get("posterId")
+
+    if not category or not lock_key or not poster_id:
+        return jsonify({"error": "category, lockKey, posterId required"}), 400
+
+    doc_id = f"{category}__{lock_key}"
+    lock_ref = db.collection("title_locks").document(doc_id)
+
+    lock_ref.update({
+        "posterId": poster_id,
+        "updatedAt": firestore.SERVER_TIMESTAMP
+    })
+
+    return jsonify({"success": True})
+
+@app.delete("/admin/title-lock/release")
+def release_title_lock():
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    data = request.json or {}
+    category = data.get("category")
+    lock_key = data.get("lockKey")
+
+    if not category or not lock_key:
+        return jsonify({"error": "category and lockKey required"}), 400
+
+    doc_id = f"{category}__{lock_key}"
+    db.collection("title_locks").document(doc_id).delete()
+
+    return jsonify({"success": True})
+
+# ============================================
 # DEBUG & HEALTH ROUTES
 # ============================================
 
@@ -990,3 +1098,4 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
