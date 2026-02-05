@@ -112,7 +112,7 @@ def assert_entitlement(uid: str, is_admin: bool, decoded: dict, content_id: str,
     - Admin / Premium users bypass checks
     - Supports per-part purchase for series
     """
-    if is_admin or time.time() < decoded.get("premiumUntil", 0):
+    if is_admin or time.time() < decoded.get("premiumExpiry", 0):
         return
 
     purchases = get_user_purchases(uid)
@@ -637,10 +637,9 @@ def get_b2_upload_token():
 # ============================================
 # PAYMENT ROUTES (Lipana Integration)
 # ============================================
-
 @app.post("/v1/payments/stk-push")
 def mpesa_stk_push():
-    """Initiate M-PESA STK push via Lipana"""
+    """Initiate M-PESA STK push via Lipana with proper metadata storage"""
     uid, is_admin, decoded, err, code = require_auth()
     if err: 
         return err, code
@@ -653,6 +652,10 @@ def mpesa_stk_push():
     item_id = data.get("item_id")
     item_name = data.get("item_name")
     item_type = data.get("item_type")
+    
+    # ✅ NEW: Capture subscription tier info
+    tier_id = data.get("tierId")  # e.g., "monthly_premium"
+    plan_type = data.get("planType", "monthly")  # Legacy fallback
 
     # Validate phone format
     if not phone or not phone.startswith("254") or len(phone) != 12:
@@ -693,12 +696,12 @@ def mpesa_stk_push():
                 print(f"ERROR: No transactionId in response: {lipana_data}")
                 return jsonify({"error": "Invalid response from payment provider"}), 500
             
-            # Store payment in Firestore
-            db.collection("users").document(uid).collection("payments").document(transaction_id).set({
+            # ✅ FIXED: Store payment metadata with ALL fields needed for callback
+            payment_data = {
+                "userId": uid,  # ✅ Critical for callback lookup
                 "itemId": item_id,
                 "itemName": item_name,
                 "itemType": item_type,
-                "planType": data.get("planType", "monthly"),
                 "amount": amount,
                 "status": "PENDING",
                 "createdAt": firestore.SERVER_TIMESTAMP,
@@ -706,7 +709,15 @@ def mpesa_stk_push():
                 "transactionId": transaction_id,
                 "paymentProvider": "lipana",
                 "phoneNumber": phone
-            })
+            }
+            
+            # ✅ Add subscription-specific fields
+            if item_type == "subscription":
+                payment_data["tierId"] = tier_id or "monthly_standard"  # Default fallback
+                payment_data["planType"] = plan_type
+            
+            # Store in user's payments subcollection
+            db.collection("users").document(uid).collection("payments").document(transaction_id).set(payment_data)
             
             return jsonify({
                 "CheckoutRequestID": transaction_id,
@@ -728,11 +739,10 @@ def mpesa_stk_push():
     except Exception as e:
         print(f"ERROR: Lipana STK Push failed: {str(e)}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
-
-
+        
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
-    """Handles payment status updates from Lipana"""
+    """Handles payment status updates from Lipana with proper tier management"""
     
     # Verify webhook signature
     signature = request.headers.get('X-Lipana-Signature') or request.headers.get('x-lipana-signature')
@@ -786,7 +796,9 @@ def lipana_callback():
             print(f"INFO: Payment {transaction_id} already processed")
             return jsonify({"message": "Already processed"}), 200
 
-        # Handle SUCCESS
+        # ============================================
+        # SUCCESS HANDLING
+        # ============================================
         if event in ["transaction.success", "payment.success"] or (status and status.lower() == "success"):
             payment_doc.reference.update({
                 "status": "COMPLETED",
@@ -795,42 +807,74 @@ def lipana_callback():
                 "resultDescription": "Payment successful"
             })
 
-            # Add to purchases
-            db.collection("users").document(uid).collection("purchases").add({
-                "amount": pay_data.get("amount"),
-                "currency": "KES",
-                "itemId": pay_data["itemId"],
-                "itemType": pay_data["itemType"],
-                "paymentMethod": "M-PESA",
-                "purchaseDate": firestore.SERVER_TIMESTAMP,
-                "purchaseStatus": "complete",
-                "receiptData": mpesa_receipt or "LIPANA_" + transaction_id,
-            })
+            # ✅ FIXED: Only create purchase record for non-subscription items
+            if pay_data.get("itemType") != "subscription":
+                db.collection("users").document(uid).collection("purchases").add({
+                    "amount": pay_data.get("amount"),
+                    "currency": "KES",
+                    "itemId": pay_data["itemId"],
+                    "itemType": pay_data["itemType"],
+                    "paymentMethod": "M-PESA",
+                    "purchaseDate": firestore.SERVER_TIMESTAMP,
+                    "purchaseStatus": "complete",
+                    "receiptData": mpesa_receipt or "LIPANA_" + transaction_id,
+                })
 
-            # Handle subscription
+            # ✅ SUBSCRIPTION HANDLING (Aligned with Dart enum)
             if pay_data.get("itemType") == "subscription":
-                user = auth.get_user(uid)
-                current_claims = user.custom_claims or {}
-                durations = {"weekly": 7, "monthly": 30, "yearly": 365}
-                days = durations.get(pay_data.get("planType"), 30)
-                current_expiry = current_claims.get("premiumUntil", 0)
+                tier_id = pay_data.get("tierId", "monthly_standard")
+                
+                # ✅ Match Dart SubscriptionTier enum values
+                tier_durations = {
+                    "weekly_lite": 7,
+                    "monthly_standard": 30,
+                    "monthly_premium": 30,
+                    "annual_standard": 365,
+                }
+                
+                days = tier_durations.get(tier_id, 30)  # Default to 30 days if unknown
+                
+                # ✅ Get current expiry from Firebase (not custom claims)
+                user_doc = db.collection("users").document(uid).get()
+                user_data = user_doc.to_dict() if user_doc.exists else {}
+                current_expiry_ts = user_data.get("premiumExpiry")
+                
+                # Convert Firestore timestamp to datetime
+                if current_expiry_ts:
+                    current_expiry = current_expiry_ts.timestamp() if hasattr(current_expiry_ts, 'timestamp') else current_expiry_ts
+                else:
+                    current_expiry = time.time()
+                
+                # Start from now or current expiry (whichever is later)
                 start_ts = max(time.time(), current_expiry)
-
                 new_expiry = datetime.fromtimestamp(start_ts) + timedelta(days=days)
                 new_ts = int(new_expiry.timestamp())
 
-                new_claims = current_claims.copy()
-                new_claims['premiumUntil'] = new_ts
-                auth.set_custom_user_claims(uid, new_claims)
-
+                # ✅ Update User Document (Primary Source of Truth)
                 db.collection("users").document(uid).update({
-                    "premiumUntil": new_ts,
-                    "isPremium": True
+                    "isPremium": True,
+                    "tierId": tier_id,
+                    "premiumExpiry": new_expiry,  # Store as Firestore Timestamp
+                    "updatedAt": firestore.SERVER_TIMESTAMP
                 })
+
+                # ✅ OPTIONAL: Sync to Custom Claims for offline token validation
+                # (Only if you use custom claims for API auth - can be skipped for pure Firestore approach)
+                try:
+                    user = auth.get_user(uid)
+                    current_claims = user.custom_claims or {}
+                    new_claims = current_claims.copy()
+                    new_claims['premiumExpiry'] = new_ts
+                    auth.set_custom_user_claims(uid, new_claims)
+                except Exception as e:
+                    print(f"WARNING: Could not update custom claims: {e}")
+                    # Non-fatal - Firestore is source of truth
 
             print(f"SUCCESS: Payment {transaction_id} completed with receipt {mpesa_receipt}")
             
-        # Handle FAILED/CANCELLED
+        # ============================================
+        # FAILURE HANDLING
+        # ============================================
         elif event in ["transaction.failed", "transaction.cancelled", "payment.failed"] or (status and status.lower() in ["failed", "cancelled"]):
             failure_reason = event_data.get("message") or event_data.get("result_description") or "Payment failed"
             payment_doc.reference.update({
@@ -849,8 +893,7 @@ def lipana_callback():
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal error"}), 500
-
-
+        
 @app.post("/v1/payments/test-complete/<transaction_id>")
 def test_complete_payment(transaction_id):
     """Manual endpoint to complete a payment (for testing only)"""
@@ -1057,6 +1100,72 @@ def release_title_lock():
 
     return jsonify({"success": True})
 
+@app.get("/v1/admin/list-files")
+def list_remote_files():
+    """
+    List files in a B2 directory for smart HLS resume.
+    Returns a map of relative filenames to their sizes.
+    """
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    path_prefix = request.args.get('path', '')
+    
+    if not path_prefix:
+        return jsonify({"error": "Path is required"}), 400
+    
+    # Ensure prefix ends with / for directory listing
+    if not path_prefix.endswith('/'):
+        path_prefix += '/'
+
+    try:
+        auth_data = authorize_b2(is_public=False)
+        
+        files_map = {}
+        next_file_name = None
+        
+        # ✅ Paginate through all files in directory
+        while True:
+            r = requests.post(
+                f"{auth_data['apiUrl']}/b2api/v2/b2_list_file_names",
+                headers={"Authorization": auth_data["authorizationToken"]},
+                json={
+                    "bucketId": B2_PRIVATE_BUCKET_ID,
+                    "prefix": path_prefix,
+                    "maxFileCount": 1000,
+                    "startFileName": next_file_name
+                },
+                timeout=30
+            )
+            r.raise_for_status()
+            data = r.json()
+            
+            for file_obj in data.get("files", []):
+                full_path = file_obj["fileName"]
+                # Extract relative name (e.g., "segment_0.ts" from "hls/movie-123/segment_0.ts")
+                rel_name = full_path.replace(path_prefix, '', 1)
+                
+                # Skip empty names (directory itself)
+                if rel_name:
+                    files_map[rel_name] = file_obj["contentLength"]
+            
+            next_file_name = data.get("nextFileName")
+            if not next_file_name:
+                break
+        
+        print(f"DEBUG: Listed {len(files_map)} files for path '{path_prefix}'")
+        
+        return jsonify({
+            "files": files_map,
+            "path": path_prefix,
+            "count": len(files_map)
+        })
+        
+    except Exception as e:
+        print(f"ERROR: List files failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+        
 # ============================================
 # DEBUG & HEALTH ROUTES
 # ============================================
