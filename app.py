@@ -40,6 +40,10 @@ AUTH_SECRET = os.getenv("AUTH_SECRET")  # MUST MATCH Cloudflare Worker
 if not AUTH_SECRET:
     raise ValueError("❌ AUTH_SECRET environment variable not set! This MUST match your Cloudflare Worker.")
 
+CRON_SECRET = os.getenv("CRON_SECRET")  # a long random string you generate
+if not CRON_SECRET:
+    raise ValueError("❌ CRON_SECRET environment variable not set! This MUST match your CRON JOB ENDPOINT.")
+
 # --- MPESA CONFIG ---
 MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
 MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET")
@@ -93,6 +97,20 @@ def require_auth() -> Tuple[Optional[str], bool, Optional[dict], Optional[Respon
         print(f"Auth error: {e}")
         return None, False, None, jsonify({"error": "Auth failed"}), 401
 
+def require_cron_or_admin():
+    """
+    Accepts either:
+    1. A Firebase admin token (for manual triggers from your app)
+    2. A static cron secret (for Render cron job)
+    """
+    # Check cron secret first
+    auth_header = request.headers.get("Authorization", "")
+    
+    if auth_header == f"Bearer {CRON_SECRET}":
+        return None, True, {}, None, None  # treat as admin
+    
+    # Fall back to Firebase auth
+    return require_auth()
 
 def get_user_purchases(uid: str) -> List[Dict]:
     """Retrieves all completed purchases for a user (1 Firestore Read)."""
@@ -1387,7 +1405,7 @@ def admin_run_scoring():
     Use after uploading content to update scores + regenerate B2 JSON.
     Replaces running fetch_and_publish_library.py from localhost.
     """
-    uid, is_admin, decoded, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_cron_or_admin()
     if err or not is_admin:
         return jsonify({"error": "Admin only"}), 403
 
@@ -1549,6 +1567,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
