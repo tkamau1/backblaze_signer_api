@@ -1,9 +1,19 @@
-- type: cron
-  name: djmovies-daily-scoring
-  schedule: "0 22 * * *"    # 01:00 EAT = 22:00 UTC previous day
-  command: >
-    python -c "
-    import sys; sys.path.insert(0, '.');
-    from main import run_scoring_and_publish;
-    run_scoring_and_publish(triggered_by='cron')
-    "
+services:
+  - type: web
+    name: backblaze-signer-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - fromGroup: dj-movies-secrets
+
+  - type: cron
+    name: djmovies-daily-scoring
+    runtime: python
+    plan: free
+    schedule: "0 22 * * *"
+    command: >
+      python -c "import sys; sys.path.insert(0, '.'); from main import run_scoring_and_publish; run_scoring_and_publish(triggered_by='cron')"
+    envVars:
+      - fromGroup: dj-movies-secrets
