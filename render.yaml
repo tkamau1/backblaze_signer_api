@@ -13,7 +13,6 @@ services:
     runtime: python
     plan: free
     schedule: "0 22 * * *"
-    command: >
-      python -c "import sys; sys.path.insert(0, '.'); from main import run_scoring_and_publish; run_scoring_and_publish(triggered_by='cron')"
+    command: python -c "import sys; sys.path.insert(0, '.'); from main import run_scoring_and_publish; run_scoring_and_publish(triggered_by='cron')"
     envVars:
       - fromGroup: dj-movies-secrets
