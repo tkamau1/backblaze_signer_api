@@ -1,0 +1,9 @@
+- type: cron
+  name: djmovies-daily-scoring
+  schedule: "0 22 * * *"    # 01:00 EAT = 22:00 UTC previous day
+  command: >
+    python -c "
+    import sys; sys.path.insert(0, '.');
+    from main import run_scoring_and_publish;
+    run_scoring_and_publish(triggered_by='cron')
+    "
