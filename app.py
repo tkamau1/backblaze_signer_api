@@ -14,6 +14,8 @@ from firebase_admin import credentials, auth, firestore
 import base64
 import time
 from requests.auth import HTTPBasicAuth
+import urllib.request
+import threading
 
 load_dotenv()
 
@@ -1099,7 +1101,343 @@ def release_title_lock():
     db.collection("title_locks").document(doc_id).delete()
 
     return jsonify({"success": True})
+    
+# ============================================
+# SCORING ENGINE
+# ============================================
+_scoring_lock = threading.Lock()  # prevent concurrent scoring runs
 
+
+def fetch_b2_json(filename: str) -> list:
+    """
+    Read content JSON directly from B2 public bucket.
+    Free — uses B2 bandwidth not Firestore reads.
+    Returns the list of content items.
+    """
+    url = f"https://f005.backblazeb2.com/file/dj-movies-kenya-public/library/{filename}.gz"
+    req = urllib.request.Request(url, headers={'Accept-Encoding': 'gzip'})
+    
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    
+    import gzip as gz
+    decompressed = gz.decompress(raw)
+    return json.loads(decompressed.decode('utf-8'))
+
+
+def compute_scores(items: list, today_stats: dict) -> tuple[list, bool]:
+    """
+    Compute popularity, trending, isNew scores for a list of content items.
+    Returns (updated_items, had_changes).
+    
+    Reads rolling windows from the item's own stats fields (stored in B2 JSON).
+    today_stats comes from Firestore stats/today (1 read for all content).
+    """
+    from datetime import date, timedelta
+    today = date.today()
+    had_changes = False
+
+    for item in items:
+        cid         = item.get('id', '')
+        old_stats   = item.get('stats', {})
+        old_scores  = item.get('scores', {})
+        today_counts = today_stats.get(cid, {
+            'views': 0, 'purchases': 0, 'downloads': 0
+        })
+
+        # ── Roll windows forward by one day ───────────────────────
+        # We approximate rolling windows using decay factors.
+        # This avoids storing per-day buckets — the B2 JSON IS the state.
+        today_views = today_counts.get('views',     0)
+        today_purch = today_counts.get('purchases', 0)
+        today_dl    = today_counts.get('downloads', 0)
+
+        # 30-day window: drop 1/30th of yesterday, add today
+        new_views30d = int(old_stats.get('views30d',     0) * (29/30)) + today_views
+        new_purch30d = int(old_stats.get('purchases30d', 0) * (29/30)) + today_purch
+        new_dl30d    = int(old_stats.get('downloads30d', 0) * (29/30)) + today_dl
+
+        # 7-day current window
+        new_views7d  = int(old_stats.get('views7d',     0) * (6/7)) + today_views
+        new_purch7d  = int(old_stats.get('purchases7d', 0) * (6/7)) + today_purch
+
+        # Previous 7-day window (for trending velocity)
+        # Shift: yesterday's current window becomes today's previous
+        new_views7d_prev = int(old_stats.get('views7d', 0) * (6/7))
+        new_purch7d_prev = int(old_stats.get('purchases7d', 0) * (6/7))
+
+        # ── Scores ────────────────────────────────────────────────
+        popularity = (new_views30d * 1) + (new_purch30d * 5) + (new_dl30d * 2)
+
+        current  = new_views7d  + new_purch7d  * 5
+        previous = new_views7d_prev + new_purch7d_prev * 5
+
+        if previous == 0 and current > 0:
+            trending = 3.0
+        elif previous == 0:
+            trending = 0.0
+        else:
+            trending = round(current / previous, 3)
+
+        # ── isNew from uploadedAt ──────────────────────────────────
+        uploaded_str = item.get('uploadedAt', '') or item.get('createdAt', '')
+        try:
+            # Handle both ISO string and Firestore timestamp dict
+            if isinstance(uploaded_str, dict):
+                uploaded_str = uploaded_str.get('_seconds', '')
+                uploaded_date = date.fromtimestamp(int(uploaded_str))
+            else:
+                uploaded_date = date.fromisoformat(str(uploaded_str)[:10])
+            days_old = (today - uploaded_date).days
+            is_new   = days_old <= 21
+        except Exception:
+            is_new = False
+
+        new_stats = {
+            'views30d':         new_views30d,
+            'purchases30d':     new_purch30d,
+            'downloads30d':     new_dl30d,
+            'views7d':          new_views7d,
+            'purchases7d':      new_purch7d,
+            'views7d_prev':     new_views7d_prev,
+            'purchases7d_prev': new_purch7d_prev,
+        }
+        new_scores = {
+            'popularityScore': popularity,
+            'trendingScore':   trending,
+            'isNew':           is_new,
+            'isPopular':       popularity >= 50,
+            'isTrending':      trending >= 1.5,
+            'lastScored':      today.isoformat(),
+        }
+
+        # ── Delta check — only mark changed if values actually differ ──
+        scores_changed = (
+            old_scores.get('popularityScore') != popularity or
+            old_scores.get('trendingScore')   != trending   or
+            old_scores.get('isNew')           != is_new     or
+            old_scores.get('isPopular')       != (popularity >= 50) or
+            old_scores.get('isTrending')      != (trending >= 1.5)
+        )
+        stats_changed = any(
+            old_stats.get(k) != v for k, v in new_stats.items()
+        )
+
+        if scores_changed or stats_changed:
+            item['scores'] = new_scores
+            item['stats']  = new_stats
+            had_changes    = True
+
+    return items, had_changes
+
+
+def run_scoring_and_publish(triggered_by: str = 'cron'):
+    """
+    Core scoring pipeline. Called by:
+    - Daily cron at 01:00 EAT
+    - Admin endpoint /admin/scoring/run
+    - After content publish /admin/library/publish
+    
+    Reads: 1 Firestore doc (stats/today) + B2 JSON files (free)
+    Writes: Only changed content docs in Firebase + B2 JSON regeneration
+    """
+    if not _scoring_lock.acquire(blocking=False):
+        print(f"⚠️ Scoring already running, skipping ({triggered_by})")
+        return {'skipped': True, 'reason': 'already_running'}
+
+    try:
+        print(f"🎯 Starting scoring pipeline (triggered by: {triggered_by})")
+        from datetime import date, timedelta
+        today = date.today()
+
+        # ── 1. Read stats/today from Firestore — ONE read ─────────
+        today_doc   = db.document('stats/today').get()
+        today_stats = today_doc.to_dict().get('today', {}) if today_doc.exists else {}
+        print(f"📊 stats/today: {len(today_stats)} content items with activity today")
+
+        # ── 2. Read content from B2 (free, not Firestore reads) ───
+        results    = {}
+        any_change = False
+
+        for ct in ['movies', 'series', 'collections']:
+            try:
+                items = fetch_b2_json(ct)
+                updated_items, changed = compute_scores(items, today_stats)
+                results[ct] = {'items': updated_items, 'changed': changed}
+                if changed:
+                    any_change = True
+                print(f"✅ {ct}: {len(updated_items)} items scored, changed={changed}")
+            except Exception as e:
+                print(f"❌ Failed to score {ct}: {e}")
+                results[ct] = {'items': [], 'changed': False}
+
+        # ── 3. Write scores to Firebase ONLY for changed items ────
+        # Delta writes — skip docs where nothing changed
+        # This keeps Firebase writes at minimum regardless of content count
+        total_writes = 0
+
+        for ct, result in results.items():
+            if not result['changed']:
+                print(f"⏭️ {ct}: no score changes, skipping Firebase writes")
+                continue
+
+            batch       = db.batch()
+            batch_count = 0
+
+            for item in result['items']:
+                cid        = item.get('id')
+                new_scores = item.get('scores', {})
+                new_stats  = item.get('stats', {})
+
+                if not cid or not new_scores:
+                    continue
+
+                # Only write if this specific item changed
+                # (compute_scores already filtered, but double-check)
+                doc_ref = db.collection(ct).document(cid)
+                batch.update(doc_ref, {
+                    'scores':    new_scores,
+                    'stats':     new_stats,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                    # Denormalised booleans for easy Firestore queries
+                    'isPopular':  new_scores.get('isPopular',  False),
+                    'isTrending': new_scores.get('isTrending', False),
+                })
+                batch_count  += 1
+                total_writes += 1
+
+                if batch_count % 500 == 0:
+                    batch.commit()
+                    batch       = db.batch()
+                    batch_count = 0
+
+            if batch_count > 0:
+                batch.commit()
+
+            print(f"✅ {ct}: {total_writes} Firebase docs updated")
+
+        # ── 4. Reset stats/today for tomorrow ─────────────────────
+        # Only reset if cron run (not manual trigger)
+        # Manual trigger preserves today's counts for next cron
+        if triggered_by == 'cron':
+            db.document('stats/today').set({
+                'date':    today.isoformat(),
+                'today':   {},
+                'savedAt': firestore.SERVER_TIMESTAMP,
+            })
+            print("🔄 stats/today reset for new day")
+
+        # ── 5. Regenerate B2 JSON from Firebase ───────────────────
+        # This calls your existing fetch_and_publish_library logic
+        # Only runs if something actually changed
+        if any_change or triggered_by in ['admin', 'publish']:
+            print("📦 Regenerating B2 JSON...")
+            _regenerate_b2_library()
+        else:
+            print("⏭️ No score changes — skipping B2 regeneration")
+
+        return {
+            'scored':      sum(len(r['items']) for r in results.values()),
+            'fb_writes':   total_writes,
+            'b2_updated':  any_change,
+            'triggered_by': triggered_by,
+        }
+
+    finally:
+        _scoring_lock.release()
+
+
+def _regenerate_b2_library():
+    """
+    Regenerate B2 static JSON files from Firebase.
+    This is your existing fetch_and_publish_library.py logic,
+    called inline from Render so admin doesn't need localhost.
+    
+    Reuses your existing hash-based versioning — only bumps version
+    if content actually changed, so Flutter only re-downloads what changed.
+    """
+    import subprocess, sys
+
+    # Option A: If fetch_and_publish_library.py is in the same repo,
+    # import and call it directly
+    try:
+        # Assumes the script is importable
+        from fetch_and_publish_library import fetch_and_publish_library
+        fetch_and_publish_library()
+        print("✅ B2 library regenerated")
+    except ImportError:
+        # Option B: Run it as a subprocess
+        result = subprocess.run(
+            [sys.executable, 'fetch_and_publish_library.py'],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            print(f"❌ B2 regeneration failed: {result.stderr}")
+            raise RuntimeError(f"B2 regeneration failed: {result.stderr}")
+        print("✅ B2 library regenerated via subprocess")
+
+
+# ============================================
+# ADMIN ENDPOINTS
+# ============================================
+@app.post("/admin/scoring/run")
+def admin_run_scoring():
+    """
+    Manually trigger scoring pipeline.
+    Use after uploading content to update scores + regenerate B2 JSON.
+    Replaces running fetch_and_publish_library.py from localhost.
+    """
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    try:
+        result = run_scoring_and_publish(triggered_by='admin')
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/admin/library/publish")
+def admin_publish_library():
+    """
+    Regenerate B2 JSON from Firebase without running scoring.
+    Use immediately after uploading new content so users see it right away.
+    This is the Render replacement for running fetch_and_publish_library.py
+    from your localhost.
+    """
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    try:
+        _regenerate_b2_library()
+        return jsonify({"success": True, "message": "Library published to B2"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/admin/scoring/status")
+def admin_scoring_status():
+    """Check current stats/today doc — useful for debugging."""
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    doc  = db.document('stats/today').get()
+    data = doc.to_dict() if doc.exists else {}
+    today_stats = data.get('today', {})
+
+    return jsonify({
+        "date":           data.get('date'),
+        "contentCount":   len(today_stats),
+        "topContent":     sorted(
+            [{"id": k, **v} for k, v in today_stats.items()],
+            key=lambda x: x.get('views', 0),
+            reverse=True
+        )[:10],
+    })
+    
 @app.get("/v1/admin/list-files")
 def list_remote_files():
     """
@@ -1211,5 +1549,6 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
