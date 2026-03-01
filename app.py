@@ -1548,81 +1548,101 @@ def config_check():
     
     print(f"DEBUG CONFIG CHECK: {config_status}")
     return jsonify(config_status)
-
 # ============================================
-# ONE-TIME MIGRATION ENDPOINT
-# Run once to move segments from private to public bucket
-# Delete after migration confirmed complete
+# ONE-TIME MIGRATION — Background Job
 # ============================================
-
 import concurrent.futures as cf
 import boto3
 
-def _migrate_one_segment(key: str, src_creds: dict, dst_creds: dict) -> dict:
-    """Move one segment from private to public bucket."""
-    try:
-        src = boto3.client(
-            "s3",
-            endpoint_url=f"https://s3.{src_creds['region']}.backblazeb2.com",
-            aws_access_key_id=src_creds["key_id"],
-            aws_secret_access_key=src_creds["app_key"],
-        )
-        dst = boto3.client(
-            "s3",
-            endpoint_url=f"https://s3.{dst_creds['region']}.backblazeb2.com",
-            aws_access_key_id=dst_creds["key_id"],
-            aws_secret_access_key=dst_creds["app_key"],
-        )
+migration_status = {
+    "running":       False,
+    "total":         0,
+    "moved":         0,
+    "already_moved": 0,
+    "failed":        0,
+    "errors":        [],
+    "done":          False,
+    "message":       "Not started",
+}
 
-        # Check if already in public bucket — skip if so
-        try:
-            dst.head_object(Bucket=dst_creds["bucket"], Key=key)
-            # Already exists — just delete from private
-            src.delete_object(Bucket=src_creds["bucket"], Key=key)
-            return {"key": key, "status": "already_moved"}
-        except Exception:
-            pass
+def _run_migration_background(segments, src_creds, dst_creds):
+    """Runs in background thread — not affected by request timeout."""
+    global migration_status
 
-        # Download from private
-        response = src.get_object(Bucket=src_creds["bucket"], Key=key)
-        data     = response["Body"].read()
+    total    = len(segments)
+    lock     = threading.Lock()
+    progress = [0]
 
-        # Upload to public
-        dst.put_object(
-            Bucket=dst_creds["bucket"],
-            Key=key,
-            Body=data,
-            ContentType="video/mp2t",
-        )
+    migration_status.update({
+        "running":       True,
+        "total":         total,
+        "moved":         0,
+        "already_moved": 0,
+        "failed":        0,
+        "errors":        [],
+        "done":          False,
+        "message":       f"Running — 0/{total}",
+    })
 
-        # Delete from private
-        src.delete_object(Bucket=src_creds["bucket"], Key=key)
+    def migrate_one(key):
+        result = _migrate_one_segment(key, src_creds, dst_creds)
+        with lock:
+            progress[0] += 1
+            status = result["status"]
 
-        return {"key": key, "status": "moved"}
+            if status == "moved":
+                migration_status["moved"] += 1
+            elif status == "already_moved":
+                migration_status["already_moved"] += 1
+            else:
+                migration_status["failed"] += 1
+                migration_status["errors"].append({
+                    "key":   result["key"],
+                    "error": result.get("error", "unknown"),
+                })
 
-    except Exception as e:
-        return {"key": key, "status": "failed", "error": str(e)}
+            migration_status["message"] = (
+                f"Running — {progress[0]}/{total} "
+                f"| moved: {migration_status['moved']} "
+                f"| failed: {migration_status['failed']}"
+            )
+
+            if progress[0] % 1000 == 0:
+                print(migration_status["message"])
+
+    with cf.ThreadPoolExecutor(max_workers=50) as executor:
+        list(executor.map(migrate_one, segments))
+
+    migration_status.update({
+        "running": False,
+        "done":    True,
+        "message": (
+            f"Complete — moved: {migration_status['moved']}, "
+            f"already_moved: {migration_status['already_moved']}, "
+            f"failed: {migration_status['failed']}"
+        ),
+    })
+    print(f"✅ {migration_status['message']}")
 
 
 @app.post("/admin/migrate/segments")
 def migrate_segments():
     """
-    One-time endpoint to migrate HLS segments from private to public bucket.
-    Runs on Render — datacenter speed, not home internet.
-    DELETE THIS ENDPOINT after migration is confirmed complete.
-
-    Body: {
-        "dry_run": true     <- set false to actually move files
-    }
+    Start background migration. Returns immediately.
+    Poll /admin/migrate/status to check progress.
     """
     uid, is_admin, decoded, err, code = require_cron_or_admin()
     if err or not is_admin:
         return jsonify({"error": "Admin only"}), 403
 
-    data           = request.json or {}
-    dry_run        = data.get("dry_run", False)
+    if migration_status["running"]:
+        return jsonify({
+            "error": "Migration already running",
+            "status": migration_status,
+        }), 409
 
-    region = B2_PRIVATE_BUCKET_NAME and "us-east-005"
+    data           = request.json or {}
+    dry_run        = data.get("dry_run", True)
 
     src_creds = {
         "key_id":  B2_PRIVATE_KEY_ID,
@@ -1637,7 +1657,7 @@ def migrate_segments():
         "region":  "us-east-005",
     }
 
-    # List all segments in private bucket
+    # List segments first (fast — just metadata)
     src = boto3.client(
         "s3",
         endpoint_url="https://s3.us-east-005.backblazeb2.com",
@@ -1646,7 +1666,10 @@ def migrate_segments():
     )
 
     paginator = src.get_paginator("list_objects_v2")
-    pages     = paginator.paginate(Bucket=src_creds["bucket"], Prefix="hls/")
+    pages     = paginator.paginate(
+        Bucket=src_creds["bucket"],
+        Prefix="hls/"
+    )
 
     segments  = []
     playlists = []
@@ -1669,56 +1692,31 @@ def migrate_segments():
             "sample":    segments[:5],
         })
 
-    # Run migration with 50 parallel workers
-    # Render ↔ B2 datacenter connection — very fast
-    results  = {"moved": 0, "already_moved": 0, "failed": 0, "errors": []}
-    lock     = threading.Lock()
-    total    = len(segments)
-    progress = [0]
-
-    def migrate_with_progress(key):
-        result = _migrate_one_segment(key, src_creds, dst_creds)
-        with lock:
-            progress[0] += 1
-            status = result["status"]
-            if status in ("moved", "already_moved"):
-                results[status] += 1
-            else:
-                results["failed"] += 1
-                results["errors"].append({
-                    "key":   result["key"],
-                    "error": result.get("error", "unknown"),
-                })
-            # Log progress every 1000 files
-            if progress[0] % 1000 == 0:
-                print(
-                    f"⏳ Progress: {progress[0]}/{total} "
-                    f"| moved: {results['moved']} "
-                    f"| failed: {results['failed']}"
-                )
-        return result
-
-    print(f"🚀 Starting migration of {total} segments with 50 workers...")
-
-    with cf.ThreadPoolExecutor(max_workers=50) as executor:
-        list(executor.map(migrate_with_progress, segments))
-
-    print(
-        f"✅ Migration complete — "
-        f"moved: {results['moved']}, "
-        f"already_moved: {results['already_moved']}, "
-        f"failed: {results['failed']}"
+    # Start migration in background thread
+    # Returns immediately — poll /admin/migrate/status for progress
+    thread = threading.Thread(
+        target=_run_migration_background,
+        args=(segments, src_creds, dst_creds),
+        daemon=True,
     )
+    thread.start()
 
     return jsonify({
-        "mode":          "LIVE",
-        "total":         total,
-        "moved":         results["moved"],
-        "already_moved": results["already_moved"],
-        "failed":        results["failed"],
-        "errors":        results["errors"][:20],
-        "playlists_kept": len(playlists),
+        "message":   "Migration started in background",
+        "total":     len(segments),
+        "playlists": len(playlists),
+        "poll":      "/admin/migrate/status",
     })
+
+
+@app.get("/admin/migrate/status")
+def migrate_status():
+    """Poll this endpoint to check migration progress."""
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    return jsonify(migration_status)
     
 @app.get("/health")
 @app.get("/")
@@ -1737,6 +1735,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
