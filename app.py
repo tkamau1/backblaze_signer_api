@@ -1614,7 +1614,7 @@ def migrate_segments():
         "dry_run": true     <- set false to actually move files
     }
     """
-    uid, is_admin, decoded, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_cron_or_admin()
     if err or not is_admin:
         return jsonify({"error": "Admin only"}), 403
 
@@ -1736,6 +1736,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
