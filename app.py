@@ -1363,37 +1363,195 @@ def run_scoring_and_publish(triggered_by: str = 'cron'):
 
     finally:
         _scoring_lock.release()
-
-
+        
 def _regenerate_b2_library():
     """
-    Regenerate B2 static JSON files from Firebase.
-    This is your existing fetch_and_publish_library.py logic,
-    called inline from Render so admin doesn't need localhost.
-    
-    Reuses your existing hash-based versioning — only bumps version
-    if content actually changed, so Flutter only re-downloads what changed.
+    Inlined version of fetch_and_publish_library.py.
+    Replicates full logic: hash versioning, metadata, gzip, b2sdk upload.
+    Runs on Render — no localhost required.
     """
-    import subprocess, sys
+    import json
+    import gzip
+    import hashlib
+    import tempfile
+    from datetime import datetime, timezone
+    from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
-    # Option A: If fetch_and_publish_library.py is in the same repo,
-    # import and call it directly
-    try:
-        # Assumes the script is importable
-        from fetch_and_publish_library import fetch_and_publish_library
-        fetch_and_publish_library()
-        print("✅ B2 library regenerated")
-    except ImportError:
-        # Option B: Run it as a subprocess
-        result = subprocess.run(
-            [sys.executable, 'fetch_and_publish_library.py'],
-            capture_output=True, text=True, timeout=300
+    print("🚀 Starting library regeneration on Render...")
+
+    # ── B2 Setup ──────────────────────────────────────────────────
+    info    = InMemoryAccountInfo()
+    b2_api  = B2Api(info)
+    b2_api.authorize_account("production", B2_PUBLIC_KEY_ID, B2_PUBLIC_APP_KEY)
+    bucket  = b2_api.get_bucket_by_name(B2_PUBLIC_BUCKET_NAME)
+
+    # ── Helpers ───────────────────────────────────────────────────
+    def upload_and_cleanup(local_path, remote_path, cache_control="max-age=3600"):
+        print(f"🔍 Checking existing versions for: {remote_path}")
+        try:
+            for fv in bucket.list_file_versions(remote_path):
+                if fv.file_name != remote_path:
+                    continue
+                print(f"🗑️ Deleting old version: {fv.id_}")
+                bucket.delete_file_version(fv.id_, fv.file_name)
+        except Exception as e:
+            print(f"⚠️ Cleanup warning: {e}")
+
+        print(f"☁️ Uploading {remote_path}...")
+        bucket.upload_local_file(
+            local_file=local_path,
+            file_name=remote_path,
+            file_info={"Cache-Control": cache_control},
         )
-        if result.returncode != 0:
-            print(f"❌ B2 regeneration failed: {result.stderr}")
-            raise RuntimeError(f"B2 regeneration failed: {result.stderr}")
-        print("✅ B2 library regenerated via subprocess")
+        print(f"✅ Uploaded: {remote_path}")
 
+    def get_data_with_ids(collection_name):
+        print(f"📥 Fetching {collection_name}...")
+        docs = db.collection(collection_name)\
+                  .where("status", "==", "public").stream()
+        items = []
+        for d in docs:
+            item = d.to_dict()
+            item["id"] = d.id
+            item["isDirty"] = False
+            # Convert Firestore timestamps to strings
+            for field in ["createdAt", "updatedAt", "uploadedAt", "premiumExpiry"]:
+                val = item.get(field)
+                if hasattr(val, "timestamp"):
+                    item[field] = val.isoformat()
+            items.append(item)
+
+        items.sort(
+            key=lambda x: x.get("createdAt", 0) if x.get("createdAt") else 0,
+            reverse=True,
+        )
+        print(f"✅ {collection_name}: {len(items)} public items")
+        return items
+
+    def generate_hash(data):
+        return hashlib.md5(
+            json.dumps(data, default=str, sort_keys=True).encode()
+        ).hexdigest()
+
+    def get_section_meta(items):
+        genres  = sorted(set(g for i in items for g in i.get("genres", []) if g))
+        artists = sorted({
+            name
+            for i in items
+            for name in (
+                i.get("djNames", [])
+                if isinstance(i.get("djNames"), list)
+                else [i.get("djName")]
+            )
+            if name
+        })
+        return {
+            "genres":      genres,
+            "artists":     artists,
+            "trendingIds": [i["id"] for i in items if i.get("isTrending")],
+            "popularIds":  [i["id"] for i in items if i.get("isPopular")],
+        }
+
+    # ── Fetch from Firestore ──────────────────────────────────────
+    movies      = get_data_with_ids("movies")
+    series      = get_data_with_ids("series")
+    collections = get_data_with_ids("collections")
+
+    metadata = {
+        "movies":       get_section_meta(movies),
+        "series":       get_section_meta(series),
+        "collections":  get_section_meta(collections),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # ── Load existing version manifest for hash comparison ────────
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+
+        downloaded = bucket.download_file_by_name("library/version.json")
+        downloaded.save_to(tmp_path)
+
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            old_manifest = json.load(f)
+
+        os.remove(tmp_path)
+        print(f"💾 Found existing manifest (v{old_manifest.get('version')})")
+
+    except Exception as e:
+        print(f"ℹ️ No existing manifest ({e}) — first run or purge")
+        old_manifest = {}
+
+    def get_version_info(key, current_data):
+        current_hash = generate_hash(current_data)
+        old_hash     = old_manifest.get(f"{key}_hash", "")
+        if current_hash == old_hash:
+            return old_manifest.get(f"{key}_version", 0), current_hash
+        return int(time.time()), current_hash
+
+    m_ver,    m_hash    = get_version_info("movies",      movies)
+    s_ver,    s_hash    = get_version_info("series",      series)
+    c_ver,    c_hash    = get_version_info("collections", collections)
+    meta_ver, meta_hash = get_version_info("metadata",    metadata)
+
+    # ── Compress and upload each file ─────────────────────────────
+    print("🗜️ Compressing and uploading library files...")
+
+    files_to_upload = {
+        "movies.json":      movies,
+        "series.json":      series,
+        "collections.json": collections,
+        "metadata.json":    metadata,
+    }
+
+    for filename, data in files_to_upload.items():
+        gz_name = f"{filename}.gz"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", delete=False, mode="w", encoding="utf-8"
+        ) as json_tmp:
+            json.dump(data, json_tmp, default=str)
+            json_tmp_path = json_tmp.name
+
+        gz_tmp_path = json_tmp_path + ".gz"
+        with open(json_tmp_path, "rb") as f_in:
+            with gzip.open(gz_tmp_path, "wb") as f_out:
+                f_out.writelines(f_in)
+
+        upload_and_cleanup(gz_tmp_path, f"library/{gz_name}")
+
+        os.remove(json_tmp_path)
+        os.remove(gz_tmp_path)
+
+    # ── Publish version manifest ──────────────────────────────────
+    version_data = {
+        "version":            int(time.time()),
+        "movies_version":     m_ver,
+        "movies_hash":        m_hash,
+        "series_version":     s_ver,
+        "series_hash":        s_hash,
+        "collections_version": c_ver,
+        "collections_hash":   c_hash,
+        "metadata_version":   meta_ver,
+        "metadata_hash":      meta_hash,
+        "updated_at":         datetime.now(timezone.utc).isoformat(),
+    }
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w"
+    ) as vtmp:
+        json.dump(version_data, vtmp)
+        vtmp_path = vtmp.name
+
+    upload_and_cleanup(vtmp_path, "library/version.json", "no-cache")
+    os.remove(vtmp_path)
+
+    print(
+        f"✅ Library published — "
+        f"Movies: v{m_ver} | Series: v{s_ver} | Collections: v{c_ver}"
+    )
 
 # ============================================
 # ADMIN ENDPOINTS
@@ -1424,7 +1582,7 @@ def admin_publish_library():
     This is the Render replacement for running fetch_and_publish_library.py
     from your localhost.
     """
-    uid, is_admin, decoded, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_cron_or_admin()
     if err or not is_admin:
         return jsonify({"error": "Admin only"}), 403
 
@@ -1438,7 +1596,7 @@ def admin_publish_library():
 @app.get("/admin/scoring/status")
 def admin_scoring_status():
     """Check current stats/today doc — useful for debugging."""
-    uid, is_admin, decoded, err, code = require_auth()
+    uid, is_admin, decoded, err, code = require_cron_or_admin()
     if err or not is_admin:
         return jsonify({"error": "Admin only"}), 403
 
@@ -1549,229 +1707,6 @@ def config_check():
     print(f"DEBUG CONFIG CHECK: {config_status}")
     return jsonify(config_status)
 
-# ============================================
-# ONE-TIME MIGRATION — Background Job
-# ============================================
-import concurrent.futures as cf
-import boto3
-
-migration_status = {
-    "running":       False,
-    "total":         0,
-    "moved":         0,
-    "already_moved": 0,
-    "failed":        0,
-    "errors":        [],
-    "done":          False,
-    "message":       "Not started",
-}
-
-
-def _run_migration_background(segments, src_creds, dst_creds):
-    """Runs in background thread — not affected by request timeout."""
-    global migration_status
-
-    total    = len(segments)
-    lock     = threading.Lock()
-    progress = [0]
-
-    migration_status.update({
-        "running":       True,
-        "total":         total,
-        "moved":         0,
-        "already_moved": 0,
-        "failed":        0,
-        "errors":        [],
-        "done":          False,
-        "message":       f"Running — 0/{total}",
-    })
-
-    def migrate_one(key):
-        """Download from private, upload to public, delete from private."""
-        try:
-            src = boto3.client(
-                "s3",
-                endpoint_url=f"https://s3.{src_creds['region']}.backblazeb2.com",
-                aws_access_key_id=src_creds["key_id"],
-                aws_secret_access_key=src_creds["app_key"],
-            )
-            dst = boto3.client(
-                "s3",
-                endpoint_url=f"https://s3.{dst_creds['region']}.backblazeb2.com",
-                aws_access_key_id=dst_creds["key_id"],
-                aws_secret_access_key=dst_creds["app_key"],
-            )
-
-            # Check if already in public bucket — skip download/upload
-            try:
-                dst.head_object(Bucket=dst_creds["bucket"], Key=key)
-                # Already exists in destination
-                src.delete_object(Bucket=src_creds["bucket"], Key=key)
-                with lock:
-                    progress[0] += 1
-                    migration_status["already_moved"] += 1
-                    migration_status["message"] = (
-                        f"Running — {progress[0]}/{total} "
-                        f"| moved: {migration_status['moved']} "
-                        f"| already_moved: {migration_status['already_moved']} "
-                        f"| failed: {migration_status['failed']}"
-                    )
-                return {"key": key, "status": "already_moved"}
-            except Exception:
-                pass  # Does not exist in dest yet — proceed
-
-            # Download from private bucket
-            response = src.get_object(Bucket=src_creds["bucket"], Key=key)
-            data     = response["Body"].read()
-
-            # Upload to public bucket
-            dst.put_object(
-                Bucket=dst_creds["bucket"],
-                Key=key,
-                Body=data,
-                ContentType="video/mp2t",
-            )
-
-            # Delete from private bucket
-            src.delete_object(Bucket=src_creds["bucket"], Key=key)
-
-            with lock:
-                progress[0] += 1
-                migration_status["moved"] += 1
-                migration_status["message"] = (
-                    f"Running — {progress[0]}/{total} "
-                    f"| moved: {migration_status['moved']} "
-                    f"| failed: {migration_status['failed']}"
-                )
-                if progress[0] % 1000 == 0:
-                    print(migration_status["message"])
-
-            return {"key": key, "status": "moved"}
-
-        except Exception as e:
-            with lock:
-                progress[0] += 1
-                migration_status["failed"] += 1
-                migration_status["errors"].append({
-                    "key":   key,
-                    "error": str(e),
-                })
-                migration_status["message"] = (
-                    f"Running — {progress[0]}/{total} "
-                    f"| moved: {migration_status['moved']} "
-                    f"| failed: {migration_status['failed']}"
-                )
-                print(f"❌ Failed: {key} — {e}")
-            return {"key": key, "status": "failed", "error": str(e)}
-
-    with cf.ThreadPoolExecutor(max_workers=50) as executor:
-        list(executor.map(migrate_one, segments))
-
-    migration_status.update({
-        "running": False,
-        "done":    True,
-        "message": (
-            f"Complete — "
-            f"moved: {migration_status['moved']}, "
-            f"already_moved: {migration_status['already_moved']}, "
-            f"failed: {migration_status['failed']}"
-        ),
-    })
-    print(f"✅ {migration_status['message']}")
-
-
-@app.post("/admin/migrate/segments")
-def migrate_segments():
-    """
-    Start background migration. Returns immediately.
-    Poll /admin/migrate/status to check progress.
-    """
-    uid, is_admin, decoded, err, code = require_cron_or_admin()
-    if err or not is_admin:
-        return jsonify({"error": "Admin only"}), 403
-
-    if migration_status["running"]:
-        return jsonify({
-            "error":  "Migration already running",
-            "status": migration_status,
-        }), 409
-
-    data    = request.json or {}
-    dry_run = data.get("dry_run", True)
-
-    src_creds = {
-        "key_id":  B2_PRIVATE_KEY_ID,
-        "app_key": B2_PRIVATE_APP_KEY,
-        "bucket":  B2_PRIVATE_BUCKET_NAME,
-        "region":  "us-east-005",
-    }
-    dst_creds = {
-        "key_id":  B2_PUBLIC_KEY_ID,
-        "app_key": B2_PUBLIC_APP_KEY,
-        "bucket":  B2_PUBLIC_BUCKET_NAME,
-        "region":  "us-east-005",
-    }
-
-    # List segments (fast — metadata only)
-    src = boto3.client(
-        "s3",
-        endpoint_url="https://s3.us-east-005.backblazeb2.com",
-        aws_access_key_id=src_creds["key_id"],
-        aws_secret_access_key=src_creds["app_key"],
-    )
-
-    paginator = src.get_paginator("list_objects_v2")
-    pages     = paginator.paginate(
-        Bucket=src_creds["bucket"],
-        Prefix="hls/"
-    )
-
-    segments  = []
-    playlists = []
-
-    for page in pages:
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".m3u8"):
-                playlists.append(key)
-            elif key.endswith(".ts") or key.endswith(".m4s"):
-                segments.append(key)
-
-    print(f"📊 Found {len(segments)} segments, {len(playlists)} playlists")
-
-    if dry_run:
-        return jsonify({
-            "mode":      "DRY RUN — nothing moved",
-            "segments":  len(segments),
-            "playlists": len(playlists),
-            "sample":    segments[:5],
-        })
-
-    # Start background thread — returns immediately
-    thread = threading.Thread(
-        target=_run_migration_background,
-        args=(segments, src_creds, dst_creds),
-        daemon=True,
-    )
-    thread.start()
-
-    return jsonify({
-        "message":   "Migration started in background",
-        "total":     len(segments),
-        "playlists": len(playlists),
-        "poll":      "/admin/migrate/status",
-    })
-
-
-@app.get("/admin/migrate/status")
-def migrate_status():
-    """Poll this to check migration progress."""
-    uid, is_admin, decoded, err, code = require_cron_or_admin()
-    if err or not is_admin:
-        return jsonify({"error": "Admin only"}), 403
-
-    return jsonify(migration_status)
-    
 @app.get("/health")
 @app.get("/")
 def health():
@@ -1789,6 +1724,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
