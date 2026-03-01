@@ -1620,7 +1620,7 @@ def migrate_segments():
         return jsonify({"error": "Admin only"}), 403
 
     data           = request.json or {}
-    dry_run        = data.get("dry_run", True)
+    dry_run        = data.get("dry_run", False)
 
     region = B2_PRIVATE_BUCKET_NAME and "us-east-005"
 
@@ -1737,6 +1737,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
