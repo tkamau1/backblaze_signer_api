@@ -1556,6 +1556,7 @@ def config_check():
 # ============================================
 
 import concurrent.futures as cf
+import boto3
 
 def _migrate_one_segment(key: str, src_creds: dict, dst_creds: dict) -> dict:
     """Move one segment from private to public bucket."""
@@ -1736,6 +1737,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
