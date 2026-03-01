@@ -1549,7 +1549,176 @@ def config_check():
     print(f"DEBUG CONFIG CHECK: {config_status}")
     return jsonify(config_status)
 
+# ============================================
+# ONE-TIME MIGRATION ENDPOINT
+# Run once to move segments from private to public bucket
+# Delete after migration confirmed complete
+# ============================================
 
+import concurrent.futures as cf
+
+def _migrate_one_segment(key: str, src_creds: dict, dst_creds: dict) -> dict:
+    """Move one segment from private to public bucket."""
+    try:
+        src = boto3.client(
+            "s3",
+            endpoint_url=f"https://s3.{src_creds['region']}.backblazeb2.com",
+            aws_access_key_id=src_creds["key_id"],
+            aws_secret_access_key=src_creds["app_key"],
+        )
+        dst = boto3.client(
+            "s3",
+            endpoint_url=f"https://s3.{dst_creds['region']}.backblazeb2.com",
+            aws_access_key_id=dst_creds["key_id"],
+            aws_secret_access_key=dst_creds["app_key"],
+        )
+
+        # Check if already in public bucket — skip if so
+        try:
+            dst.head_object(Bucket=dst_creds["bucket"], Key=key)
+            # Already exists — just delete from private
+            src.delete_object(Bucket=src_creds["bucket"], Key=key)
+            return {"key": key, "status": "already_moved"}
+        except Exception:
+            pass
+
+        # Download from private
+        response = src.get_object(Bucket=src_creds["bucket"], Key=key)
+        data     = response["Body"].read()
+
+        # Upload to public
+        dst.put_object(
+            Bucket=dst_creds["bucket"],
+            Key=key,
+            Body=data,
+            ContentType="video/mp2t",
+        )
+
+        # Delete from private
+        src.delete_object(Bucket=src_creds["bucket"], Key=key)
+
+        return {"key": key, "status": "moved"}
+
+    except Exception as e:
+        return {"key": key, "status": "failed", "error": str(e)}
+
+
+@app.post("/admin/migrate/segments")
+def migrate_segments():
+    """
+    One-time endpoint to migrate HLS segments from private to public bucket.
+    Runs on Render — datacenter speed, not home internet.
+    DELETE THIS ENDPOINT after migration is confirmed complete.
+
+    Body: {
+        "dry_run": true     <- set false to actually move files
+    }
+    """
+    uid, is_admin, decoded, err, code = require_auth()
+    if err or not is_admin:
+        return jsonify({"error": "Admin only"}), 403
+
+    data           = request.json or {}
+    dry_run        = data.get("dry_run", True)
+
+    region = B2_PRIVATE_BUCKET_NAME and "us-east-005"
+
+    src_creds = {
+        "key_id":  B2_PRIVATE_KEY_ID,
+        "app_key": B2_PRIVATE_APP_KEY,
+        "bucket":  B2_PRIVATE_BUCKET_NAME,
+        "region":  "us-east-005",
+    }
+    dst_creds = {
+        "key_id":  B2_PUBLIC_KEY_ID,
+        "app_key": B2_PUBLIC_APP_KEY,
+        "bucket":  B2_PUBLIC_BUCKET_NAME,
+        "region":  "us-east-005",
+    }
+
+    # List all segments in private bucket
+    src = boto3.client(
+        "s3",
+        endpoint_url="https://s3.us-east-005.backblazeb2.com",
+        aws_access_key_id=src_creds["key_id"],
+        aws_secret_access_key=src_creds["app_key"],
+    )
+
+    paginator = src.get_paginator("list_objects_v2")
+    pages     = paginator.paginate(Bucket=src_creds["bucket"], Prefix="hls/")
+
+    segments  = []
+    playlists = []
+
+    for page in pages:
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".m3u8"):
+                playlists.append(key)
+            elif key.endswith(".ts") or key.endswith(".m4s"):
+                segments.append(key)
+
+    print(f"📊 Found {len(segments)} segments, {len(playlists)} playlists")
+
+    if dry_run:
+        return jsonify({
+            "mode":      "DRY RUN — nothing moved",
+            "segments":  len(segments),
+            "playlists": len(playlists),
+            "sample":    segments[:5],
+        })
+
+    # Run migration with 50 parallel workers
+    # Render ↔ B2 datacenter connection — very fast
+    results  = {"moved": 0, "already_moved": 0, "failed": 0, "errors": []}
+    lock     = threading.Lock()
+    total    = len(segments)
+    progress = [0]
+
+    def migrate_with_progress(key):
+        result = _migrate_one_segment(key, src_creds, dst_creds)
+        with lock:
+            progress[0] += 1
+            status = result["status"]
+            if status in ("moved", "already_moved"):
+                results[status] += 1
+            else:
+                results["failed"] += 1
+                results["errors"].append({
+                    "key":   result["key"],
+                    "error": result.get("error", "unknown"),
+                })
+            # Log progress every 1000 files
+            if progress[0] % 1000 == 0:
+                print(
+                    f"⏳ Progress: {progress[0]}/{total} "
+                    f"| moved: {results['moved']} "
+                    f"| failed: {results['failed']}"
+                )
+        return result
+
+    print(f"🚀 Starting migration of {total} segments with 50 workers...")
+
+    with cf.ThreadPoolExecutor(max_workers=50) as executor:
+        list(executor.map(migrate_with_progress, segments))
+
+    print(
+        f"✅ Migration complete — "
+        f"moved: {results['moved']}, "
+        f"already_moved: {results['already_moved']}, "
+        f"failed: {results['failed']}"
+    )
+
+    return jsonify({
+        "mode":          "LIVE",
+        "total":         total,
+        "moved":         results["moved"],
+        "already_moved": results["already_moved"],
+        "failed":        results["failed"],
+        "errors":        results["errors"][:20],
+        "playlists_kept": len(playlists),
+    })
+    
 @app.get("/health")
 @app.get("/")
 def health():
@@ -1567,6 +1736,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
