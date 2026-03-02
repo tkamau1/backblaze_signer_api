@@ -6,3 +6,4 @@ gunicorn==23.0.0
 flask-cors==6.0.1
 cachetools==5.3.3
 boto3==1.42.59
+b2sdk==2.10.3
