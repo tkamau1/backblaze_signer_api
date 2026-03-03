@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple, Optional
 import hmac
@@ -16,6 +16,11 @@ import time
 from requests.auth import HTTPBasicAuth
 import urllib.request
 import threading
+import json
+import gzip
+import hashlib
+import tempfile
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
 load_dotenv()
 
@@ -1138,7 +1143,6 @@ def fetch_b2_json(filename: str) -> list:
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
     
-    import gzip as gz
     decompressed = gz.decompress(raw)
     return json.loads(decompressed.decode('utf-8'))
 
@@ -1370,13 +1374,6 @@ def _regenerate_b2_library():
     Replicates full logic: hash versioning, metadata, gzip, b2sdk upload.
     Runs on Render — no localhost required.
     """
-    import json
-    import gzip
-    import hashlib
-    import tempfile
-    from datetime import datetime, timezone
-    from b2sdk.v2 import InMemoryAccountInfo, B2Api
-
     print("🚀 Starting library regeneration on Render...")
 
     # ── B2 Setup ──────────────────────────────────────────────────
@@ -1724,6 +1721,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
