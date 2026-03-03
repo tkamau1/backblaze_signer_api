@@ -1132,7 +1132,7 @@ def fetch_b2_json(filename: str) -> list:
     Free — uses B2 bandwidth not Firestore reads.
     Returns the list of content items.
     """
-    url = f"https://f005.backblazeb2.com/file/dj-movies-kenya-public/library/{filename}.gz"
+    url = f"https://f005.backblazeb2.com/file/dj-movies-kenya-public/library/{filename}.json.gz"
     req = urllib.request.Request(url, headers={'Accept-Encoding': 'gzip'})
     
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1724,6 +1724,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
