@@ -17,7 +17,7 @@ from requests.auth import HTTPBasicAuth
 import urllib.request
 import threading
 import json
-import gzip
+import gzip as gz
 import hashlib
 import tempfile
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
@@ -1721,6 +1721,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
