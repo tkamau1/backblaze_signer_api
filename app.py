@@ -17,7 +17,7 @@ from requests.auth import HTTPBasicAuth
 import urllib.request
 import threading
 import json
-import gzip as gz
+import gzip
 import hashlib
 import tempfile
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
@@ -1143,7 +1143,7 @@ def fetch_b2_json(filename: str) -> list:
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read()
     
-    decompressed = gz.decompress(raw)
+    decompressed = gzip.decompress(raw)
     return json.loads(decompressed.decode('utf-8'))
 
 
@@ -1721,6 +1721,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
