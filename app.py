@@ -1151,30 +1151,70 @@ def compute_scores(items: list, today_stats: dict) -> tuple[list, bool]:
     """
     Compute popularity, trending, isNew scores for a list of content items.
     Returns (updated_items, had_changes).
-    
+
     Reads rolling windows from the item's own stats fields (stored in B2 JSON).
     today_stats comes from Firestore stats/today (1 read for all content).
+
+    Cold-start guard
+    ----------------
+    If lastScored is None, this doc only has a seed (never been real-scored).
+    We skip computing real scores until at least one real activity event exists
+    (any view, purchase, or download today OR any non-zero rolling window).
+    This prevents the scheduled job from overwriting a healthy seed with zeros.
+    We still update isNew (time-based, always reliable) even during the guard.
     """
-    from datetime import date, timedelta
+    from datetime import date
     today = date.today()
     had_changes = False
 
     for item in items:
-        cid         = item.get('id', '')
-        old_stats   = item.get('stats', {})
-        old_scores  = item.get('scores', {})
+        cid          = item.get('id', '')
+        old_stats    = item.get('stats', {})
+        old_scores   = item.get('scores', {})
         today_counts = today_stats.get(cid, {
             'views': 0, 'purchases': 0, 'downloads': 0
         })
 
-        # ── Roll windows forward by one day ───────────────────────
-        # We approximate rolling windows using decay factors.
-        # This avoids storing per-day buckets — the B2 JSON IS the state.
         today_views = today_counts.get('views',     0)
         today_purch = today_counts.get('purchases', 0)
         today_dl    = today_counts.get('downloads', 0)
 
-        # 30-day window: drop 1/30th of yesterday, add today
+        # ── isNew — compute regardless of cold-start state ────────────────
+        uploaded_str = item.get('uploadedAt', '') or item.get('createdAt', '')
+        try:
+            if isinstance(uploaded_str, dict):
+                uploaded_date = date.fromtimestamp(int(uploaded_str.get('_seconds', 0)))
+            else:
+                uploaded_date = date.fromisoformat(str(uploaded_str)[:10])
+            days_old = (today - uploaded_date).days
+            is_new   = days_old <= 21
+        except Exception:
+            is_new = old_scores.get('isNew', False)
+
+        # ── Cold-start guard ──────────────────────────────────────────────
+        # lastScored=None means only a seed exists — never been real-scored.
+        # Skip full compute if there is genuinely no activity data yet.
+        never_scored = old_scores.get('lastScored') is None
+
+        has_activity = (
+            today_views > 0 or today_purch > 0 or today_dl > 0
+            or old_stats.get('views30d',     0) > 0
+            or old_stats.get('purchases30d', 0) > 0
+            or old_stats.get('downloads30d', 0) > 0
+        )
+
+        if never_scored and not has_activity:
+            # No real data yet — preserve seed scores, only refresh isNew
+            if is_new != old_scores.get('isNew'):
+                item['scores'] = {**old_scores, 'isNew': is_new}
+                had_changes    = True
+            continue
+
+        # ── Roll windows forward by one day ───────────────────────────────
+        # Exponential decay approximates a rolling window without per-day buckets.
+        # The B2 JSON IS the state — no separate time-series storage needed.
+
+        # 30-day window: retain 29/30 of yesterday, add today
         new_views30d = int(old_stats.get('views30d',     0) * (29/30)) + today_views
         new_purch30d = int(old_stats.get('purchases30d', 0) * (29/30)) + today_purch
         new_dl30d    = int(old_stats.get('downloads30d', 0) * (29/30)) + today_dl
@@ -1184,36 +1224,22 @@ def compute_scores(items: list, today_stats: dict) -> tuple[list, bool]:
         new_purch7d  = int(old_stats.get('purchases7d', 0) * (6/7)) + today_purch
 
         # Previous 7-day window (for trending velocity)
-        # Shift: yesterday's current window becomes today's previous
-        new_views7d_prev = int(old_stats.get('views7d', 0) * (6/7))
+        # Shift: yesterday's decayed window becomes today's previous baseline
+        new_views7d_prev = int(old_stats.get('views7d',     0) * (6/7))
         new_purch7d_prev = int(old_stats.get('purchases7d', 0) * (6/7))
 
-        # ── Scores ────────────────────────────────────────────────
+        # ── Scores ────────────────────────────────────────────────────────
         popularity = (new_views30d * 1) + (new_purch30d * 5) + (new_dl30d * 2)
 
         current  = new_views7d  + new_purch7d  * 5
         previous = new_views7d_prev + new_purch7d_prev * 5
 
         if previous == 0 and current > 0:
-            trending = 3.0
+            trending = 3.0      # new activity with no prior baseline → spike
         elif previous == 0:
             trending = 0.0
         else:
             trending = round(current / previous, 3)
-
-        # ── isNew from uploadedAt ──────────────────────────────────
-        uploaded_str = item.get('uploadedAt', '') or item.get('createdAt', '')
-        try:
-            # Handle both ISO string and Firestore timestamp dict
-            if isinstance(uploaded_str, dict):
-                uploaded_str = uploaded_str.get('_seconds', '')
-                uploaded_date = date.fromtimestamp(int(uploaded_str))
-            else:
-                uploaded_date = date.fromisoformat(str(uploaded_str)[:10])
-            days_old = (today - uploaded_date).days
-            is_new   = days_old <= 21
-        except Exception:
-            is_new = False
 
         new_stats = {
             'views30d':         new_views30d,
@@ -1229,17 +1255,17 @@ def compute_scores(items: list, today_stats: dict) -> tuple[list, bool]:
             'trendingScore':   trending,
             'isNew':           is_new,
             'isPopular':       popularity >= 50,
-            'isTrending':      trending >= 1.5,
+            'isTrending':      trending  >= 1.5,
             'lastScored':      today.isoformat(),
         }
 
-        # ── Delta check — only mark changed if values actually differ ──
+        # ── Delta check — only flag changed if values actually differ ──────
         scores_changed = (
-            old_scores.get('popularityScore') != popularity or
-            old_scores.get('trendingScore')   != trending   or
-            old_scores.get('isNew')           != is_new     or
-            old_scores.get('isPopular')       != (popularity >= 50) or
-            old_scores.get('isTrending')      != (trending >= 1.5)
+            old_scores.get('popularityScore') != popularity          or
+            old_scores.get('trendingScore')   != trending            or
+            old_scores.get('isNew')           != is_new              or
+            old_scores.get('isPopular')       != (popularity >= 50)  or
+            old_scores.get('isTrending')      != (trending  >= 1.5)
         )
         stats_changed = any(
             old_stats.get(k) != v for k, v in new_stats.items()
@@ -1251,7 +1277,6 @@ def compute_scores(items: list, today_stats: dict) -> tuple[list, bool]:
             had_changes    = True
 
     return items, had_changes
-
 
 def run_scoring_and_publish(triggered_by: str = 'cron'):
     """
@@ -1721,6 +1746,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
