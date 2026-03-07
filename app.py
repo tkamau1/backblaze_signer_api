@@ -379,7 +379,7 @@ def sign_movie():
     
     movie = get_content_doc("movies", movie_id)
     if not movie:
-    return jsonify({"error": "Movie not found"}), 404
+        return jsonify({"error": "Movie not found"}), 404
         
     # Check entitlement (skip for free content)
     try:
@@ -409,7 +409,7 @@ def sign_series():
     
     series_data = get_content_doc("series", series_id)
     if not series_data:
-    return jsonify({"error": "Series not found"}), 404
+        return jsonify({"error": "Series not found"}), 404
         
     # Check entitlement
     try:
@@ -458,7 +458,7 @@ def sign_series_part():
     
     series_data = get_content_doc("series", series_id)
     if not series_data:
-    return jsonify({"error": "Series not found"}), 404
+        return jsonify({"error": "Series not found"}), 404
        
     parts = series_data.get("parts", [])
     
@@ -502,7 +502,7 @@ def sign_collection():
     
     coll = get_content_doc("collections", collection_id)
     if not coll:
-    return jsonify({"error": "Collection not found"}), 404
+        return jsonify({"error": "Collection not found"}), 404
            
     # Check entitlement
     try:
@@ -546,7 +546,7 @@ def sign_collection_movie():
       
     coll = get_content_doc("collections", collection_id)
     if not coll:
-    return jsonify({"error": "Collection not found"}), 404
+        return jsonify({"error": "Collection not found"}), 404
     
     movie = next(
         (m for m in coll.get("movies", [])
@@ -1721,6 +1721,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
