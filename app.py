@@ -1387,9 +1387,6 @@ def run_scoring_and_publish(triggered_by: str = 'cron'):
                     'scores':    new_scores,
                     'stats':     new_stats,
                     'updatedAt': firestore.SERVER_TIMESTAMP,
-                    # Denormalised booleans for easy Firestore queries
-                    'isPopular':  new_scores.get('isPopular',  False),
-                    'isTrending': new_scores.get('isTrending', False),
                 })
                 batch_count  += 1
                 total_writes += 1
@@ -1511,8 +1508,8 @@ def _regenerate_b2_library():
         return {
             "genres":      genres,
             "artists":     artists,
-            "trendingIds": [i["id"] for i in items if i.get("isTrending")],
-            "popularIds":  [i["id"] for i in items if i.get("isPopular")],
+            "trendingIds": [i["id"] for i in items if i.get("scores", {}).get("isTrending")],
+            "popularIds":  [i["id"] for i in items if i.get("scores", {}).get("isPopular")],
         }
 
     # ── Fetch from Firestore ──────────────────────────────────────
@@ -1721,6 +1718,7 @@ if __name__ == "__main__":
     print(f"📡 CDN Domain: {CDN_DOMAIN}")
     print(f"🔐 Auth Secret: {'✅ Configured' if AUTH_SECRET else '❌ MISSING'}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
