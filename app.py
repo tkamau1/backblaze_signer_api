@@ -404,11 +404,14 @@ def sign_series():
         return err, code
 
     series_id = request.json.get("seriesId")
+    part_id = request.json.get("partId")
+
     if not series_id:
         return jsonify({"error": "seriesId required"}), 400
     
     series_data = get_content_doc("series", series_id)
     if not series_data:
+        print(f"ERROR: Series {series_id} not found in Firestore")
         return jsonify({"error": "Series not found"}), 404
         
     # Check entitlement
@@ -434,9 +437,17 @@ def sign_series():
             "expiresIn": cdn_data["expiresIn"]
         })
 
+    # Compatibility for SignService.dart (expects a single 'url' if it's the specific part requested)
+    requested_part_url = None
+    if part_id:
+        requested_part = next((p for p in signed_parts if p.get("partId") == part_id), None)
+        if requested_part:
+            requested_part_url = requested_part["url"]
+
     return jsonify({
         "seriesId": series_id,
         "parts": signed_parts,
+        "url": requested_part_url or (signed_parts[0]["url"] if signed_parts else None),
         "expiresIn": signed_parts[0]["expiresIn"] if signed_parts else 3600
     })
 
@@ -527,6 +538,7 @@ def sign_collection():
     return jsonify({
         "collectionId": collection_id,
         "movies": signed,
+        "url": signed[0]["url"] if signed else None,
         "expiresIn": signed[0]["expiresIn"] if signed else 3600
     })
 
