@@ -21,6 +21,7 @@ import gzip
 import hashlib
 import tempfile
 from b2sdk.v2 import InMemoryAccountInfo, B2Api
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 load_dotenv()
 
@@ -126,7 +127,7 @@ def get_user_purchases(uid: str) -> List[Dict]:
     
     # Single read: Fetch all completed items at once
     snaps = db.collection("users").document(uid).collection("purchases")\
-              .where("purchaseStatus", "==", "complete").get()
+              .where(filter=FieldFilter("purchaseStatus", "==", "complete")).get()
     
     purchases = [s.to_dict() for s in snaps]
     user_purchase_cache[uid] = purchases
@@ -743,14 +744,13 @@ def mpesa_stk_push():
     lipana_url = f"{LIPANA_BASE_URL}/transactions/push-stk"
 
     try:
-        # ✅ Reduced from 30s to 10s — STK push is just queuing, not processing
         response = requests.post(
             lipana_url,
             json=lipana_payload,
             headers=headers,
-            timeout=10   # <-- was 30
+            timeout=(3, 15)  # (connect_timeout, read_timeout)
         )
-        
+
         print(f"DEBUG: Lipana Response Status: {response.status_code}")
 
         if response.status_code in [200, 201]:
@@ -758,10 +758,10 @@ def mpesa_stk_push():
             response_data = lipana_data.get("data", {})
             transaction_id = response_data.get("transactionId")
             checkout_id = response_data.get("checkoutRequestID") or transaction_id
-            
+
             if not transaction_id:
                 return jsonify({"error": "Invalid response from payment provider"}), 500
-            
+
             payment_data = {
                 "userId": uid,
                 "itemId": item_id,
@@ -775,14 +775,14 @@ def mpesa_stk_push():
                 "paymentProvider": "lipana",
                 "phoneNumber": phone
             }
-            
+
             if item_type == "subscription":
                 payment_data["tierId"] = tier_id or "monthly_standard"
                 payment_data["planType"] = plan_type
-            
+
             db.collection("users").document(uid).collection("payments") \
               .document(transaction_id).set(payment_data)
-            
+
             return jsonify({
                 "CheckoutRequestID": transaction_id,
                 "CustomerMessage": response_data.get("message", "STK Push sent to your phone"),
@@ -794,29 +794,40 @@ def mpesa_stk_push():
             print(f"ERROR: Lipana returned {response.status_code}: {error_data}")
             return jsonify({"error": "Payment request failed", "details": error_data}), response.status_code
 
-    except requests.exceptions.Timeout:
-        # ✅ Specific timeout handling — don't expose internals to client
-        print(f"ERROR: Lipana STK push timed out after 10s")
+    except requests.exceptions.ConnectTimeout:
+        # 3s connect timeout hit — Lipana is unreachable (DNS fail, no TCP handshake)
+        print("ERROR: Lipana is unreachable (connect timeout 3s)")
         return jsonify({
-            "error": "Payment service is slow to respond. Please try again.",
-            "code": "TIMEOUT"
+            "error": "Payment service is currently unavailable. Please try again later.",
+            "code": "SERVICE_DOWN"
+        }), 503
+
+    except requests.exceptions.ReadTimeout:
+        # TCP connected fine but no response within 15s — Lipana is up but overloaded
+        print("ERROR: Lipana connected but did not respond in time (read timeout 15s)")
+        return jsonify({
+            "error": "Payment service is slow to respond. Please try again in a moment.",
+            "code": "SERVICE_SLOW"
         }), 504
 
     except requests.exceptions.ConnectionError as e:
-        print(f"ERROR: Could not connect to Lipana: {e}")
+        # TCP refused or DNS resolution failed immediately
+        print(f"ERROR: Lipana connection error — {e}")
         return jsonify({
-            "error": "Could not reach payment service. Check your connection.",
+            "error": "Cannot reach payment service.",
             "code": "CONNECTION_ERROR"
         }), 503
 
     except requests.exceptions.RequestException as e:
+        # Any other requests-level error (SSL, redirect loop, etc.)
         print(f"ERROR: Network error calling Lipana: {e}")
         return jsonify({"error": f"Payment service unavailable: {str(e)}"}), 500
 
     except Exception as e:
         print(f"ERROR: Lipana STK Push failed: {e}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
-        
+
+
 @app.post("/v1/payments/lipana-callback")
 def lipana_callback():
     """Handles payment status updates from Lipana with proper tier management"""
@@ -857,7 +868,7 @@ def lipana_callback():
 
         # Find the payment document
         payment_query = db.collection_group("payments")\
-            .where("transactionId", "==", transaction_id)\
+            .where(filter=FieldFilter("transactionId", "==", transaction_id))\
             .limit(1).get()
 
         if not payment_query:
@@ -1479,7 +1490,7 @@ def _regenerate_b2_library():
     def get_data_with_ids(collection_name):
         print(f"📥 Fetching {collection_name}...")
         docs = db.collection(collection_name)\
-                  .where("status", "==", "public").stream()
+                  .where(filter=FieldFilter("status", "==", "public")).stream()
         items = []
         for d in docs:
             item = d.to_dict()
