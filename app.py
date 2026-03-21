@@ -717,9 +717,8 @@ def get_b2_upload_token():
 # ============================================
 @app.post("/v1/payments/stk-push")
 def mpesa_stk_push():
-    """Initiate M-PESA STK push via Lipana with proper metadata storage"""
     uid, is_admin, decoded, err, code = require_auth()
-    if err: 
+    if err:
         return err, code
 
     data = request.json
@@ -730,53 +729,41 @@ def mpesa_stk_push():
     item_id = data.get("item_id")
     item_name = data.get("item_name")
     item_type = data.get("item_type")
-    
-    # ✅ NEW: Capture subscription tier info
-    tier_id = data.get("tierId")  # e.g., "monthly_premium"
-    plan_type = data.get("planType", "monthly")  # Legacy fallback
+    tier_id = data.get("tierId")
+    plan_type = data.get("planType", "monthly")
 
-    # Validate phone format
     if not phone or not phone.startswith("254") or len(phone) != 12:
         return jsonify({"error": "Phone must be in format 254XXXXXXXXX"}), 400
 
-    # Prepare Lipana STK Push request
-    lipana_payload = {
-        "phone": phone,
-        "amount": amount
-    }
-
+    lipana_payload = {"phone": phone, "amount": amount}
     headers = {
         "x-api-key": LIPANA_SECRET_KEY,
         "Content-Type": "application/json"
     }
-
     lipana_url = f"{LIPANA_BASE_URL}/transactions/push-stk"
 
     try:
+        # ✅ Reduced from 30s to 10s — STK push is just queuing, not processing
         response = requests.post(
             lipana_url,
             json=lipana_payload,
             headers=headers,
-            timeout=30
+            timeout=10   # <-- was 30
         )
         
         print(f"DEBUG: Lipana Response Status: {response.status_code}")
-        print(f"DEBUG: Lipana Response Body: {response.text}")
 
         if response.status_code in [200, 201]:
             lipana_data = response.json()
             response_data = lipana_data.get("data", {})
-            
             transaction_id = response_data.get("transactionId")
             checkout_id = response_data.get("checkoutRequestID") or transaction_id
             
             if not transaction_id:
-                print(f"ERROR: No transactionId in response: {lipana_data}")
                 return jsonify({"error": "Invalid response from payment provider"}), 500
             
-            # ✅ FIXED: Store payment metadata with ALL fields needed for callback
             payment_data = {
-                "userId": uid,  # ✅ Critical for callback lookup
+                "userId": uid,
                 "itemId": item_id,
                 "itemName": item_name,
                 "itemType": item_type,
@@ -789,13 +776,12 @@ def mpesa_stk_push():
                 "phoneNumber": phone
             }
             
-            # ✅ Add subscription-specific fields
             if item_type == "subscription":
-                payment_data["tierId"] = tier_id or "monthly_standard"  # Default fallback
+                payment_data["tierId"] = tier_id or "monthly_standard"
                 payment_data["planType"] = plan_type
             
-            # Store in user's payments subcollection
-            db.collection("users").document(uid).collection("payments").document(transaction_id).set(payment_data)
+            db.collection("users").document(uid).collection("payments") \
+              .document(transaction_id).set(payment_data)
             
             return jsonify({
                 "CheckoutRequestID": transaction_id,
@@ -806,16 +792,29 @@ def mpesa_stk_push():
         else:
             error_data = response.json() if 'application/json' in response.headers.get('content-type', '') else {"error": response.text}
             print(f"ERROR: Lipana returned {response.status_code}: {error_data}")
-            return jsonify({
-                "error": "Payment request failed", 
-                "details": error_data
-            }), response.status_code
-            
+            return jsonify({"error": "Payment request failed", "details": error_data}), response.status_code
+
+    except requests.exceptions.Timeout:
+        # ✅ Specific timeout handling — don't expose internals to client
+        print(f"ERROR: Lipana STK push timed out after 10s")
+        return jsonify({
+            "error": "Payment service is slow to respond. Please try again.",
+            "code": "TIMEOUT"
+        }), 504
+
+    except requests.exceptions.ConnectionError as e:
+        print(f"ERROR: Could not connect to Lipana: {e}")
+        return jsonify({
+            "error": "Could not reach payment service. Check your connection.",
+            "code": "CONNECTION_ERROR"
+        }), 503
+
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: Network error calling Lipana: {str(e)}")
+        print(f"ERROR: Network error calling Lipana: {e}")
         return jsonify({"error": f"Payment service unavailable: {str(e)}"}), 500
+
     except Exception as e:
-        print(f"ERROR: Lipana STK Push failed: {str(e)}")
+        print(f"ERROR: Lipana STK Push failed: {e}")
         return jsonify({"error": f"Payment initiation failed: {str(e)}"}), 500
         
 @app.post("/v1/payments/lipana-callback")
